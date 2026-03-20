@@ -1,0 +1,434 @@
+name: Build Dev Artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to checkout (branch, tag, or SHA)"
+        required: false
+        default: "main"
+        type: string
+      build_python:
+        description: "Build Python dev artifacts"
+        required: true
+        default: true
+        type: boolean
+      build_java:
+        description: "Build Java dev artifacts"
+        required: true
+        default: true
+        type: boolean
+      debug:
+        description: "Keep debug symbols in Python wheels"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  python-linux:
+    if: ${{ inputs.build_python }}
+    timeout-minutes: 60
+    name: Python Linux 3.${{ matrix.python-minor-version }} ${{ matrix.config.platform }} manylinux${{ matrix.config.manylinux }}
+    strategy:
+      matrix:
+        python-minor-version: ["9"]
+        config:
+          - platform: x86_64
+            manylinux: "2_17"
+            extra_args: ""
+            runner: ubuntu-22.04
+          - platform: x86_64
+            manylinux: "2_28"
+            extra_args: "--features fp16kernels"
+            runner: ubuntu-22.04
+          - platform: aarch64
+            manylinux: "2_17"
+            extra_args: ""
+            runner: ubuntu-24.04-arm64-4x
+          - platform: aarch64
+            manylinux: "2_28"
+            extra_args: "--features fp16kernels"
+            runner: ubuntu-24.04-arm64-4x
+    runs-on: ${{ matrix.config.runner }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          lfs: true
+      - name: Set up Python
+        uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4
+        with:
+          python-version: 3.${{ matrix.python-minor-version }}
+      - name: Prepare dev build tree
+        shell: bash
+        run: |
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          BUILD_ROOT=$(python -c 'import tempfile; from pathlib import Path; print(Path(tempfile.mkdtemp(prefix="lance-dev-build-")).as_posix())')
+          DEV_VERSION=$(python ci/set_dev_build_version.py \
+            --source-root "$PWD" \
+            --build-root "$BUILD_ROOT" \
+            --language python \
+            --run-number "$GITHUB_RUN_NUMBER" \
+            --sha "$SHORT_SHA")
+          ARTIFACT_VERSION=${DEV_VERSION//+/__}
+          echo "SHORT_SHA=$SHORT_SHA" >> "$GITHUB_ENV"
+          echo "BUILD_ROOT=$BUILD_ROOT" >> "$GITHUB_ENV"
+          echo "DEV_VERSION=$DEV_VERSION" >> "$GITHUB_ENV"
+          echo "ARTIFACT_VERSION=$ARTIFACT_VERSION" >> "$GITHUB_ENV"
+      - name: Clean old wheels
+        shell: bash
+        run: |
+          rm -f "${BUILD_ROOT}/python/target/wheels"/pylance-*.whl || true
+      - name: Build x86_64 Manylinux2014 wheel
+        if: ${{ matrix.config.platform == 'x86_64' && matrix.config.manylinux == '2_17' }}
+        uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad # v1
+        with:
+          command: build
+          working-directory: ${{ env.BUILD_ROOT }}/python
+          target: x86_64-unknown-linux-gnu
+          manylinux: ${{ matrix.config.manylinux }}
+          args: "--release ${{ (!inputs.debug) && '--strip' || '' }} ${{ matrix.config.extra_args }}"
+          maturin-version: "1.10.2"
+          before-script-linux: |
+            set -e
+            yum install -y openssl-devel \
+              && curl -L https://github.com/protocolbuffers/protobuf/releases/download/v24.4/protoc-24.4-linux-$(uname -m).zip > /tmp/protoc.zip \
+              && unzip /tmp/protoc.zip -d /usr/local \
+              && rm /tmp/protoc.zip
+      - name: Build x86_64 Manylinux wheel
+        if: ${{ matrix.config.platform == 'x86_64' && matrix.config.manylinux != '2_17' }}
+        uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad # v1
+        with:
+          command: build
+          working-directory: ${{ env.BUILD_ROOT }}/python
+          target: x86_64-unknown-linux-gnu
+          manylinux: ${{ matrix.config.manylinux }}
+          docker-options: |
+            -e CC=clang
+            -e CXX=clang++
+          args: "--release ${{ (!inputs.debug) && '--strip' || '' }} ${{ matrix.config.extra_args }}"
+          maturin-version: "1.10.2"
+          before-script-linux: |
+            set -e
+            yum install -y openssl-devel clang \
+              && curl -L https://github.com/protocolbuffers/protobuf/releases/download/v24.4/protoc-24.4-linux-$(uname -m).zip > /tmp/protoc.zip \
+              && unzip /tmp/protoc.zip -d /usr/local \
+              && rm /tmp/protoc.zip
+      - name: Build Arm Manylinux wheel
+        if: ${{ matrix.config.platform == 'aarch64' }}
+        uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad # v1
+        with:
+          command: build
+          working-directory: ${{ env.BUILD_ROOT }}/python
+          target: aarch64-unknown-linux-gnu
+          manylinux: ${{ matrix.config.manylinux }}
+          args: "--release ${{ (!inputs.debug) && '--strip' || '' }} ${{ matrix.config.extra_args }}"
+          maturin-version: "1.10.2"
+          before-script-linux: |
+            set -e
+            yum install -y openssl-devel clang \
+              && curl -L https://github.com/protocolbuffers/protobuf/releases/download/v24.4/protoc-24.4-linux-aarch_64.zip > /tmp/protoc.zip \
+              && unzip /tmp/protoc.zip -d /usr/local \
+              && rm /tmp/protoc.zip
+      - name: Upload wheels
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pylance-${{ env.ARTIFACT_VERSION }}-manylinux_${{ matrix.config.manylinux }}_${{ matrix.config.platform }}
+          path: ${{ env.BUILD_ROOT }}/python/target/wheels/*.whl
+          retention-days: 14
+
+  python-mac:
+    if: ${{ inputs.build_python }}
+    timeout-minutes: 60
+    runs-on: warp-macos-14-arm64-6x
+    env:
+      MACOSX_DEPLOYMENT_TARGET: 10.15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          lfs: true
+      - name: Set up Python
+        uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4
+        with:
+          python-version: 3.13
+      - name: Prepare dev build tree
+        shell: bash
+        run: |
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          BUILD_ROOT=$(python -c 'import tempfile; from pathlib import Path; print(Path(tempfile.mkdtemp(prefix="lance-dev-build-")).as_posix())')
+          DEV_VERSION=$(python ci/set_dev_build_version.py \
+            --source-root "$PWD" \
+            --build-root "$BUILD_ROOT" \
+            --language python \
+            --run-number "$GITHUB_RUN_NUMBER" \
+            --sha "$SHORT_SHA")
+          ARTIFACT_VERSION=${DEV_VERSION//+/__}
+          echo "BUILD_ROOT=$BUILD_ROOT" >> "$GITHUB_ENV"
+          echo "DEV_VERSION=$DEV_VERSION" >> "$GITHUB_ENV"
+          echo "ARTIFACT_VERSION=$ARTIFACT_VERSION" >> "$GITHUB_ENV"
+      - name: Install macos dependency
+        shell: bash
+        run: |
+          brew install protobuf
+      - name: Build wheel
+        uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad # v1
+        with:
+          command: build
+          working-directory: ${{ env.BUILD_ROOT }}/python
+          args: "--release ${{ (!inputs.debug) && '--strip' || '' }} --target aarch64-apple-darwin --features fp16kernels"
+      - name: Upload wheel
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pylance-${{ env.ARTIFACT_VERSION }}-macosx_arm64
+          path: ${{ env.BUILD_ROOT }}/python/target/wheels/*.whl
+          retention-days: 14
+
+  python-windows:
+    if: ${{ inputs.build_python }}
+    timeout-minutes: 60
+    runs-on: windows-latest-4x
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          lfs: true
+      - name: Set up Python
+        uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4
+        with:
+          python-version: 3.9
+      - name: Prepare dev build tree
+        shell: bash
+        run: |
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          BUILD_ROOT=$(python -c 'import tempfile; from pathlib import Path; print(Path(tempfile.mkdtemp(prefix="lance-dev-build-")).as_posix())')
+          DEV_VERSION=$(python ci/set_dev_build_version.py \
+            --source-root "$PWD" \
+            --build-root "$BUILD_ROOT" \
+            --language python \
+            --run-number "$GITHUB_RUN_NUMBER" \
+            --sha "$SHORT_SHA")
+          ARTIFACT_VERSION=${DEV_VERSION//+/__}
+          echo "BUILD_ROOT=$BUILD_ROOT" >> "$GITHUB_ENV"
+          echo "DEV_VERSION=$DEV_VERSION" >> "$GITHUB_ENV"
+          echo "ARTIFACT_VERSION=$ARTIFACT_VERSION" >> "$GITHUB_ENV"
+      - name: Install Protoc v21.12
+        working-directory: C:\
+        run: |
+          New-Item -Path 'C:\protoc' -ItemType Directory
+          Set-Location C:\protoc
+          Invoke-WebRequest https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-win64.zip -OutFile C:\protoc\protoc.zip
+          7z x protoc.zip
+          Add-Content $env:GITHUB_PATH "C:\protoc\bin"
+        shell: powershell
+      - name: Build wheel
+        uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad # v1
+        with:
+          command: build
+          working-directory: ${{ env.BUILD_ROOT }}/python
+          args: "--release ${{ (!inputs.debug) && '--strip' || '' }}"
+      - name: Upload wheel
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pylance-${{ env.ARTIFACT_VERSION }}-win_amd64
+          path: ${{ env.BUILD_ROOT }}/python/target/wheels/*.whl
+          retention-days: 14
+
+  java-linux-arm64:
+    if: ${{ inputs.build_java }}
+    name: Java Linux Arm64
+    runs-on: ubuntu-24.04-arm64-8x
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Set up Python
+        uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4
+        with:
+          python-version: "3.11"
+      - name: Prepare dev build tree
+        shell: bash
+        run: |
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          BUILD_ROOT=$(python -c 'import tempfile; from pathlib import Path; print(Path(tempfile.mkdtemp(prefix="lance-dev-build-")).as_posix())')
+          DEV_VERSION=$(python ci/set_dev_build_version.py \
+            --source-root "$PWD" \
+            --build-root "$BUILD_ROOT" \
+            --language java \
+            --run-number "$GITHUB_RUN_NUMBER" \
+            --sha "$SHORT_SHA")
+          echo "BUILD_ROOT=$BUILD_ROOT" >> "$GITHUB_ENV"
+          echo "DEV_VERSION=$DEV_VERSION" >> "$GITHUB_ENV"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build Linux Arm64 native library
+        shell: bash
+        run: |
+          docker run --platform linux/arm64 -v "${BUILD_ROOT}:/workspace" -w /workspace debian:10 bash -c "
+            set -ex
+            echo 'deb http://archive.debian.org/debian/ buster main' > /etc/apt/sources.list
+            echo 'deb http://archive.debian.org/debian-security buster/updates main' >> /etc/apt/sources.list
+            echo 'deb http://archive.debian.org/debian/ buster-updates main' >> /etc/apt/sources.list
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --assume-yes \
+              apt-transport-https ca-certificates curl gpg bash less openssl libssl-dev pkg-config \
+              libsqlite3-dev libsqlite3-0 libreadline-dev git cmake dh-autoreconf clang g++ libc++-dev \
+              libc++abi-dev libprotobuf-dev libncurses5-dev libncursesw5-dev libudev-dev libhidapi-dev \
+              zip unzip
+            PROTOC_ZIP=protoc-3.15.0-linux-aarch_64.zip
+            curl -OL https://github.com/protocolbuffers/protobuf/releases/download/v3.15.0/\$PROTOC_ZIP
+            unzip -o \$PROTOC_ZIP -d /usr/local
+            rm -f \$PROTOC_ZIP
+            curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
+            source \$HOME/.cargo/env
+            cd java/lance-jni
+            export CC=clang
+            export CXX=clang++
+            cargo build --release
+          "
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dev-liblance_jni_linux_arm64
+          path: ${{ env.BUILD_ROOT }}/java/lance-jni/target/release/liblance_jni.so
+          retention-days: 1
+          if-no-files-found: error
+
+  java-linux-x86:
+    if: ${{ inputs.build_java }}
+    name: Java Linux x86-64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Set up Python
+        uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4
+        with:
+          python-version: "3.11"
+      - name: Prepare dev build tree
+        shell: bash
+        run: |
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          BUILD_ROOT=$(python -c 'import tempfile; from pathlib import Path; print(Path(tempfile.mkdtemp(prefix="lance-dev-build-")).as_posix())')
+          DEV_VERSION=$(python ci/set_dev_build_version.py \
+            --source-root "$PWD" \
+            --build-root "$BUILD_ROOT" \
+            --language java \
+            --run-number "$GITHUB_RUN_NUMBER" \
+            --sha "$SHORT_SHA")
+          echo "BUILD_ROOT=$BUILD_ROOT" >> "$GITHUB_ENV"
+          echo "DEV_VERSION=$DEV_VERSION" >> "$GITHUB_ENV"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build Linux x86-64 native library
+        shell: bash
+        run: |
+          docker run --platform linux/amd64 -v "${BUILD_ROOT}:/workspace" -w /workspace debian:10 bash -c "
+            set -ex
+            echo 'deb http://archive.debian.org/debian/ buster main' > /etc/apt/sources.list
+            echo 'deb http://archive.debian.org/debian-security buster/updates main' >> /etc/apt/sources.list
+            echo 'deb http://archive.debian.org/debian/ buster-updates main' >> /etc/apt/sources.list
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --assume-yes \
+              apt-transport-https ca-certificates curl gpg bash less openssl libssl-dev pkg-config \
+              libsqlite3-dev libsqlite3-0 libreadline-dev git cmake dh-autoreconf clang g++ libc++-dev \
+              libc++abi-dev libprotobuf-dev libncurses5-dev libncursesw5-dev libudev-dev libhidapi-dev \
+              zip unzip
+            PROTOC_ZIP=protoc-3.15.0-linux-x86_64.zip
+            curl -OL https://github.com/protocolbuffers/protobuf/releases/download/v3.15.0/\$PROTOC_ZIP
+            unzip -o \$PROTOC_ZIP -d /usr/local
+            rm -f \$PROTOC_ZIP
+            curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
+            source \$HOME/.cargo/env
+            cd java/lance-jni
+            export CC=clang
+            export CXX=clang++
+            cargo build --release
+          "
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dev-liblance_jni_linux_x86_64
+          path: ${{ env.BUILD_ROOT }}/java/lance-jni/target/release/liblance_jni.so
+          retention-days: 1
+          if-no-files-found: error
+
+  java-macos-arm64:
+    if: ${{ inputs.build_java }}
+    name: Java MacOS Arm64
+    runs-on: warp-macos-14-arm64-6x
+    timeout-minutes: 60
+    needs:
+      - java-linux-arm64
+      - java-linux-x86
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Set up Python
+        uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4
+        with:
+          python-version: "3.11"
+      - name: Prepare dev build tree
+        shell: bash
+        run: |
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          BUILD_ROOT=$(python -c 'import tempfile; from pathlib import Path; print(Path(tempfile.mkdtemp(prefix="lance-dev-build-")).as_posix())')
+          DEV_VERSION=$(python ci/set_dev_build_version.py \
+            --source-root "$PWD" \
+            --build-root "$BUILD_ROOT" \
+            --language java \
+            --run-number "$GITHUB_RUN_NUMBER" \
+            --sha "$SHORT_SHA")
+          ARTIFACT_VERSION=${DEV_VERSION//+/__}
+          echo "BUILD_ROOT=$BUILD_ROOT" >> "$GITHUB_ENV"
+          echo "DEV_VERSION=$DEV_VERSION" >> "$GITHUB_ENV"
+          echo "ARTIFACT_VERSION=$ARTIFACT_VERSION" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          workspaces: ${{ env.BUILD_ROOT }}/java/lance-jni
+      - name: Set up Java 11
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: corretto
+          java-version: 11
+          cache: "maven"
+      - uses: Homebrew/actions/setup-homebrew@50b8c2ab4a835c38897ed2c56c293b07167c0b59 # master 2026-03-07
+      - name: Install dependencies
+        shell: bash
+        run: |
+          brew install protobuf
+      - name: Download Linux native libraries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: dev-liblance_jni_linux_*
+          path: ${{ env.BUILD_ROOT }}/downloads
+      - name: Copy native libs
+        shell: bash
+        run: |
+          mkdir -p "${BUILD_ROOT}/java/target/classes/nativelib/linux-x86-64" "${BUILD_ROOT}/java/target/classes/nativelib/linux-aarch64"
+          cp "${BUILD_ROOT}/downloads/dev-liblance_jni_linux_x86_64/liblance_jni.so" "${BUILD_ROOT}/java/target/classes/nativelib/linux-x86-64/liblance_jni.so"
+          cp "${BUILD_ROOT}/downloads/dev-liblance_jni_linux_arm64/liblance_jni.so" "${BUILD_ROOT}/java/target/classes/nativelib/linux-aarch64/liblance_jni.so"
+      - name: Package Java artifacts
+        shell: bash
+        working-directory: ${{ env.BUILD_ROOT }}/java
+        run: |
+          ./mvnw --batch-mode -DskipTests -Drust.release.build=true package
+      - name: Upload Java artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: lance-java-${{ env.ARTIFACT_VERSION }}
+          path: |
+            ${{ env.BUILD_ROOT }}/java/target/*.jar
+          retention-days: 14
+
