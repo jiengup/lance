@@ -12,7 +12,7 @@ use lance_index::{
     metrics::NoOpMetricsCollector,
     optimize::OptimizeOptions,
     progress::NoopIndexBuildProgress,
-    scalar::{CreatedIndex, OldIndexDataFilter, lance_format::LanceIndexStore},
+    scalar::{OldIndexDataFilter, lance_format::LanceIndexStore},
 };
 use lance_table::format::{Fragment, IndexMetadata, list_index_files_with_sizes};
 use roaring::RoaringBitmap;
@@ -28,13 +28,8 @@ use crate::index::vector_index_details;
 
 #[derive(Debug, Clone)]
 pub struct IndexMergeResults<'a> {
-    pub new_uuid: Uuid,
     pub removed_indices: Vec<&'a IndexMetadata>,
-    pub new_fragment_bitmap: RoaringBitmap,
-    pub new_index_version: i32,
-    pub new_index_details: prost_types::Any,
-    /// List of files and their sizes for the merged index
-    pub files: Option<Vec<lance_table::format::IndexFile>>,
+    pub new_indices: Vec<IndexMetadata>,
 }
 
 async fn build_stable_row_id_filter(
@@ -76,12 +71,6 @@ async fn build_stable_row_id_filter(
 /// into a new index, to improve the query performance.
 ///
 /// The merge behavior is controlled by [`OptimizeOptions::num_indices_to_merge].
-///
-/// Returns
-/// -------
-/// - the UUID of the new index
-/// - merged indices,
-/// - Bitmap of the fragments that covered in the newly created index.
 pub async fn merge_indices<'a>(
     dataset: Arc<Dataset>,
     old_indices: &[&'a IndexMetadata],
@@ -155,7 +144,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
     });
 
     let index_type = indices[0].index_type();
-    let (new_uuid, indices_merged, created_index) = match index_type {
+    let (new_indices, indices_merged) = match index_type {
         it if it.is_scalar() => {
             // Use effective bitmap (intersected with existing dataset fragments)
             // to avoid carrying stale data from pruned indices.
@@ -230,8 +219,29 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     .await?
             };
 
-            // TODO: don't hard-code index version
-            Ok((new_uuid, 1, created_index))
+            let removed_indices = old_indices[old_indices.len() - 1..].to_vec();
+            for removed in removed_indices.iter() {
+                if let Some(effective) = removed.effective_fragment_bitmap(&dataset.fragment_bitmap)
+                {
+                    frag_bitmap |= &effective;
+                }
+            }
+
+            Ok((
+                vec![IndexMetadata {
+                    uuid: new_uuid,
+                    fields: old_indices[0].fields.clone(),
+                    name: old_indices[0].name.clone(),
+                    dataset_version: dataset.manifest.version,
+                    fragment_bitmap: Some(frag_bitmap),
+                    index_details: Some(Arc::new(created_index.index_details)),
+                    index_version: created_index.index_version as i32,
+                    created_at: Some(chrono::Utc::now()),
+                    base_id: None,
+                    files: created_index.files,
+                }],
+                1,
+            ))
         }
         it if it.is_vector() => {
             let new_data_stream = if unindexed.is_empty() {
@@ -250,7 +260,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 Some(scanner.try_into_stream().await?)
             };
 
-            let (new_uuid, indices_merged) = optimize_vector_indices(
+            let (new_uuids, indices_merged) = optimize_vector_indices(
                 dataset.as_ref().clone(),
                 new_data_stream,
                 &field_path,
@@ -260,27 +270,51 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             .boxed()
             .await?;
 
-            old_indices[old_indices.len() - indices_merged..]
-                .iter()
-                .for_each(|idx| {
-                    frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
-                });
+            let removed_indices = old_indices[old_indices.len() - indices_merged..].to_vec();
+            for removed in removed_indices.iter() {
+                if let Some(effective) = removed.effective_fragment_bitmap(&dataset.fragment_bitmap)
+                {
+                    frag_bitmap |= &effective;
+                }
+            }
 
-            // Capture file sizes for the new vector index
-            let index_dir = dataset.indices_dir().child(new_uuid.to_string());
-            let files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
-
+            let index_version = it.version();
+            let index_details = vector_index_details();
             Ok((
-                new_uuid,
+                new_uuids
+                    .into_iter()
+                    .map(|new_uuid| {
+                        let dataset = dataset.clone();
+                        let index_details = index_details.clone();
+                        let template = old_indices[0].clone();
+                        let fragment_bitmap = frag_bitmap.clone();
+                        async move {
+                            let index_dir = dataset.indices_dir().child(new_uuid.to_string());
+                            // We still need to populate manifest file metadata here because
+                            // optimize_vector_indices only returns output UUIDs today.
+                            // TODO: Consider returning per-output file metadata directly from
+                            // optimize_vector_indices so optimize can avoid this extra list call.
+                            let files =
+                                list_index_files_with_sizes(&dataset.object_store, &index_dir)
+                                    .await?;
+                            Ok::<IndexMetadata, Error>(IndexMetadata {
+                                uuid: new_uuid,
+                                fields: template.fields,
+                                name: template.name,
+                                dataset_version: dataset.manifest.version,
+                                fragment_bitmap: Some(fragment_bitmap),
+                                index_details: Some(Arc::new(index_details)),
+                                index_version: index_version as i32,
+                                created_at: Some(chrono::Utc::now()),
+                                base_id: None,
+                                files: Some(files),
+                            })
+                        }
+                    })
+                    .collect::<futures::stream::FuturesOrdered<_>>()
+                    .try_collect::<Vec<_>>()
+                    .await?,
                 indices_merged,
-                CreatedIndex {
-                    index_details: vector_index_details(),
-                    // retain_supported_indices guarantees all old_indices have
-                    // index_version <= our max supported version, so we can safely
-                    // write the current library's version for this index type.
-                    index_version: it.version() as u32,
-                    files: Some(files),
-                },
             ))
         }
         _ => Err(Error::index(format!(
@@ -290,19 +324,9 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
     }?;
 
     let removed_indices = old_indices[old_indices.len() - indices_merged..].to_vec();
-    for removed in removed_indices.iter() {
-        if let Some(effective) = removed.effective_fragment_bitmap(&dataset.fragment_bitmap) {
-            frag_bitmap |= &effective;
-        }
-    }
-
     Ok(Some(IndexMergeResults {
-        new_uuid,
         removed_indices,
-        new_fragment_bitmap: frag_bitmap,
-        new_index_version: created_index.index_version as i32,
-        new_index_details: created_index.index_details,
-        files: created_index.files,
+        new_indices,
     }))
 }
 
@@ -662,8 +686,13 @@ mod tests {
         assert!(merge_result.is_some());
         let merge_result = merge_result.unwrap();
 
+        assert_eq!(merge_result.new_indices.len(), 1);
+
         // Verify that the new index covers all fragments
-        let new_fragment_bitmap = &merge_result.new_fragment_bitmap;
+        let new_fragment_bitmap = merge_result.new_indices[0]
+            .fragment_bitmap
+            .as_ref()
+            .unwrap();
 
         // Check that unindexed fragments are now included
         for fragment in &unindexed_fragments {

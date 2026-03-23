@@ -269,14 +269,14 @@ impl std::fmt::Debug for IVFIndex {
 
 // TODO: move to `lance-index` crate.
 ///
-/// Returns (new_uuid, num_indices_merged)
+/// Returns (new index UUIDs, num_indices_merged)
 pub(crate) async fn optimize_vector_indices(
     dataset: Dataset,
     unindexed: Option<impl RecordBatchStream + Unpin + 'static>,
     vector_column: &str,
     existing_indices: &[Arc<dyn Index>],
     options: &OptimizeOptions,
-) -> Result<(Uuid, usize)> {
+) -> Result<(Vec<Uuid>, usize)> {
     // Sanity check the indices
     if existing_indices.is_empty() {
         return Err(Error::index(
@@ -354,7 +354,7 @@ pub(crate) async fn optimize_vector_indices(
 
     // never change the index version,
     // because we won't update the legacy vector index format
-    Ok((new_uuid, merged))
+    Ok((vec![new_uuid], merged))
 }
 
 pub(crate) async fn optimize_vector_indices_v2(
@@ -363,7 +363,7 @@ pub(crate) async fn optimize_vector_indices_v2(
     vector_column: &str,
     existing_indices: &[Arc<dyn Index>],
     options: &OptimizeOptions,
-) -> Result<(Uuid, usize)> {
+) -> Result<(Vec<Uuid>, usize)> {
     // Sanity check the indices
     if existing_indices.is_empty() {
         return Err(Error::index(
@@ -561,7 +561,7 @@ pub(crate) async fn optimize_vector_indices_v2(
         }
     };
 
-    Ok((new_uuid, merged_num))
+    Ok((vec![new_uuid], merged_num))
 }
 
 #[allow(clippy::too_many_arguments)]

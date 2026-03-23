@@ -937,21 +937,8 @@ impl DatasetIndexExt for Dataset {
                 continue;
             };
 
-            let last_idx = deltas.last().expect("Delta indices should not be empty");
-            let new_idx = IndexMetadata {
-                uuid: res.new_uuid,
-                name: last_idx.name.clone(), // Keep the same name
-                fields: last_idx.fields.clone(),
-                dataset_version: self.manifest.version,
-                fragment_bitmap: Some(res.new_fragment_bitmap),
-                index_details: Some(Arc::new(res.new_index_details)),
-                index_version: res.new_index_version,
-                created_at: Some(chrono::Utc::now()),
-                base_id: None, // New merged index file locates in the cloned dataset.
-                files: res.files,
-            };
             removed_indices.extend(res.removed_indices.iter().map(|&idx| idx.clone()));
-            new_indices.push(new_idx);
+            new_indices.extend(res.new_indices);
         }
 
         if new_indices.is_empty() {
