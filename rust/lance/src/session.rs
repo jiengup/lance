@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use deepsize::DeepSizeOf;
-use lance_core::cache::{CacheBackend, LanceCache};
+use lance_core::cache::LanceCache;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
 use lance_io::object_store::ObjectStoreRegistry;
@@ -77,7 +77,11 @@ impl std::fmt::Debug for Session {
             )
             .field(
                 "file_metadata_cache",
-                &format!("LanceCache(items={})", self.metadata_cache.0.approx_size(),),
+                &format!(
+                    "LanceCache(items={}, size_bytes={})",
+                    self.metadata_cache.0.approx_size(),
+                    self.metadata_cache.0.approx_size(),
+                ),
             )
             .field(
                 "index_extensions",
@@ -110,12 +114,9 @@ impl Session {
         }
     }
 
-    /// Create a session with a custom index cache backend.
-    ///
-    /// The provided backend will be used for caching index data. The metadata
-    /// cache will use the default Moka-based backend with the given capacity.
+    /// Create a session with a custom [`CacheBackend`] for the index cache.
     pub fn with_index_cache_backend(
-        index_cache_backend: Arc<dyn CacheBackend>,
+        index_cache_backend: Arc<dyn lance_core::cache::CacheBackend>,
         metadata_cache_size: usize,
         store_registry: Arc<ObjectStoreRegistry>,
     ) -> Self {
@@ -195,11 +196,6 @@ impl Session {
         self.store_registry.clone()
     }
 
-    /// Get a reference to the raw metadata cache (for use in index reconstruction).
-    pub fn file_metadata_cache(&self) -> &LanceCache {
-        &self.metadata_cache.0
-    }
-
     /// Fetch statistics for the metadata cache
     pub async fn metadata_cache_stats(&self) -> lance_core::cache::CacheStats {
         self.metadata_cache.0.stats().await
@@ -224,21 +220,7 @@ impl Default for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lance_core::cache::UnsizedCacheKey;
     use lance_index::vector::VectorIndex;
-    use std::borrow::Cow;
-
-    struct TestUnsizedKey(&'static str);
-    impl UnsizedCacheKey for TestUnsizedKey {
-        type ValueType = dyn VectorIndex;
-        fn key(&self) -> Cow<'_, str> {
-            Cow::Borrowed(self.0)
-        }
-
-        fn type_name(&self) -> &'static str {
-            "TestUnsized"
-        }
-    }
 
     #[tokio::test]
     async fn test_disable_index_cache() {
@@ -246,7 +228,7 @@ mod tests {
         assert!(
             no_cache
                 .index_cache
-                .get_unsized_with_key(&TestUnsizedKey("abc"))
+                .get_unsized::<dyn VectorIndex>("abc")
                 .await
                 .is_none()
         );

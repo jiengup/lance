@@ -26,18 +26,23 @@ use lance_core::utils::tokio::spawn_cpu;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::reader::{FileReader, FileReaderOptions};
+use lance_file::LanceEncodingsIo;
+use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions};
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::{LocalMetricsCollector, MetricsCollector, NoOpMetricsCollector};
 use lance_index::vector::VectorIndexCacheEntry;
-use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
+use lance_index::vector::bq::builder::RabitQuantizer;
+use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::ProductQuantizer;
-use lance_index::vector::quantizer::{QuantizationType, Quantizer};
+use lance_index::vector::quantizer::{
+    QuantizationType, Quantizer, QuantizerMetadata, QuantizerStorage,
+};
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::storage::VectorStore;
 use lance_index::vector::v3::subindex::SubIndexType;
+use lance_index::vector::{IvfIndexState, VectorIndexData};
 use lance_index::{
     INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, Index, IndexType, pb,
     vector::{
@@ -59,6 +64,58 @@ use roaring::RoaringBitmap;
 use tracing::{info, instrument};
 
 use super::{IvfIndexPartitionStatistics, IvfIndexStatistics, centroids_to_vectors};
+
+struct FileMetadataCacheKey;
+
+impl CacheKey for FileMetadataCacheKey {
+    type ValueType = CachedFileMetadata;
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        "".into()
+    }
+    fn type_name(&self) -> &'static str {
+        "FileMetadata"
+    }
+}
+
+/// Open a FileReader, reusing cached file metadata if available.
+async fn open_reader_cached(
+    scheduler: &Arc<ScanScheduler>,
+    path: &Path,
+    cache: &LanceCache,
+    known_file_size: u64,
+) -> Result<FileReader> {
+    let file_cache = cache.with_key_prefix(path.as_ref());
+    let cached_size = if known_file_size > 0 {
+        CachedFileSize::new(known_file_size)
+    } else {
+        CachedFileSize::unknown()
+    };
+
+    if let Some(cached_meta) = file_cache.get_with_key(&FileMetadataCacheKey).await {
+        let file_scheduler = scheduler.open_file(path, &cached_size).await?;
+        let encodings_io = Arc::new(LanceEncodingsIo::new(file_scheduler));
+        FileReader::try_open_with_file_metadata(
+            encodings_io,
+            path.clone(),
+            None,
+            Arc::<DecoderPlugins>::default(),
+            cached_meta,
+            cache,
+            FileReaderOptions::default(),
+        )
+        .await
+    } else {
+        let file_scheduler = scheduler.open_file(path, &cached_size).await?;
+        FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            cache,
+            FileReaderOptions::default(),
+        )
+        .await
+    }
+}
 
 #[derive(Debug, DeepSizeOf)]
 pub struct PartitionEntry<S: IvfSubIndex, Q: Quantization> {
@@ -98,8 +155,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> CacheKey for IVFPartit
     }
 
     fn type_name(&self) -> &'static str {
-        // Using type_name is safe here: the impl is in the same crate as the
-        // types, so the monomorphized pointer is consistent.
         std::any::type_name::<PartitionEntry<S, Q>>()
     }
 }
@@ -107,7 +162,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> CacheKey for IVFPartit
 /// IVF Index.
 #[derive(Debug)]
 pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
+    /// Local display path (via `to_local_path`), used for statistics.
     uri: String,
+    /// Object-store path to the index file (forward-slash separated).
+    /// Used by `cacheable_state()` for cross-platform reconstruction.
+    index_path: String,
     uuid: String,
 
     /// Ivf model
@@ -131,6 +190,7 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
 impl<S: IvfSubIndex, Q: Quantization> DeepSizeOf for IVFIndex<S, Q> {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         self.uri.deep_size_of_children(context)
+            + self.index_path.deep_size_of_children(context)
             + self.ivf.deep_size_of_children(context)
             + self.sub_index_metadata.deep_size_of_children(context)
             + self.uuid.deep_size_of_children(context)
@@ -216,9 +276,24 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let storage =
             IvfQuantizationStorage::try_new(storage_reader, frag_reuse_index.clone()).await?;
 
+        // Cache file metadata so reconstructions from IvfIndexState can skip
+        // footer reads.
+        file_metadata_cache
+            .with_key_prefix(uri.as_ref())
+            .insert_with_key(&FileMetadataCacheKey, index_reader.metadata().clone())
+            .await;
+        let aux_path = index_dir
+            .child(uuid.as_str())
+            .child(INDEX_AUXILIARY_FILE_NAME);
+        file_metadata_cache
+            .with_key_prefix(aux_path.as_ref())
+            .insert_with_key(&FileMetadataCacheKey, storage.reader().metadata().clone())
+            .await;
+
         let num_partitions = ivf.num_partitions();
         Ok(Self {
             uri: to_local_path(&uri),
+            index_path: uri.as_ref().to_string(),
             uuid,
             ivf,
             reader: index_reader,
@@ -230,6 +305,37 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             io_parallelism,
             _marker: PhantomData,
         })
+    }
+
+    /// Reconstruct an IVFIndex from pre-parsed state without any I/O.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_cached_state(
+        uri: String,
+        index_path: String,
+        uuid: String,
+        ivf: IvfModel,
+        reader: FileReader,
+        storage: IvfQuantizationStorage<Q>,
+        sub_index_metadata: Vec<String>,
+        distance_type: DistanceType,
+        index_cache: LanceCache,
+        io_parallelism: usize,
+    ) -> Self {
+        let num_partitions = ivf.num_partitions();
+        Self {
+            uri,
+            index_path,
+            uuid,
+            ivf,
+            reader,
+            storage,
+            partition_locks: PartitionLoadLock::new(num_partitions),
+            sub_index_metadata,
+            distance_type,
+            index_cache: WeakLanceCache::from(&index_cache),
+            io_parallelism,
+            _marker: PhantomData,
+        }
     }
 
     #[instrument(level = "debug", skip(self, metrics))]
@@ -358,7 +464,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
 
     fn index_type(&self) -> IndexType {
         match self.sub_index_type() {
-            (SubIndexType::Flat, QuantizationType::Flat) => IndexType::IvfFlat,
+            (SubIndexType::Flat, QuantizationType::Flat)
+            | (SubIndexType::Flat, QuantizationType::FlatBin) => IndexType::IvfFlat,
             (SubIndexType::Flat, QuantizationType::Product) => IndexType::IvfPq,
             (SubIndexType::Flat, QuantizationType::Scalar) => IndexType::IvfSq,
             (SubIndexType::Flat, QuantizationType::Rabit) => IndexType::IvfRq,
@@ -399,10 +506,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
 
         sub_index_stats.append(store_stats);
         if S::name() == "FLAT" {
-            sub_index_stats.insert(
-                "index_type".to_string(),
-                Q::quantization_type().to_string().into(),
-            );
+            let qt_label = match Q::quantization_type() {
+                // FlatBin is the Hamming variant of Flat; report as "FLAT".
+                QuantizationType::FlatBin => "FLAT".to_string(),
+                other => other.to_string(),
+            };
+            sub_index_stats.insert("index_type".to_string(), qt_label.into());
         } else {
             sub_index_stats.insert("index_type".to_string(), S::name().into());
         }
@@ -602,12 +711,202 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
     fn metric_type(&self) -> DistanceType {
         self.distance_type
     }
+
+    fn cacheable_state(&self) -> Option<Box<dyn VectorIndexData>> {
+        let quantizer_metadata_json = serde_json::to_string(self.storage.metadata()).ok()?;
+        let quantizer_extra_data = self
+            .storage
+            .metadata()
+            .extra_metadata()
+            .ok()?
+            .map(|b| b.to_vec());
+        let (sub_index_type, quantization_type) = self.sub_index_type();
+        Some(Box::new(IvfIndexState {
+            index_file_path: self.index_path.clone(),
+            uuid: self.uuid.clone(),
+            ivf: self.ivf.clone(),
+            aux_ivf: self.storage.ivf().clone(),
+            distance_type: self.distance_type,
+            sub_index_metadata: self.sub_index_metadata.clone(),
+            quantizer_metadata_json,
+            quantizer_extra_data,
+            sub_index_type,
+            quantization_type,
+            cache_key_prefix: self.index_cache.prefix().to_string(),
+            index_file_size: self.reader.metadata().file_size(),
+            aux_file_size: self.storage.reader().metadata().file_size(),
+        }))
+    }
 }
 
 pub type IvfFlatIndex = IVFIndex<FlatIndex, FlatQuantizer>;
 pub type IvfPq = IVFIndex<FlatIndex, ProductQuantizer>;
 pub type IvfHnswSqIndex = IVFIndex<HNSW, ScalarQuantizer>;
 pub type IvfHnswPqIndex = IVFIndex<HNSW, ProductQuantizer>;
+
+/// Reconstruct a live [`VectorIndex`] from a cached [`IvfIndexState`].
+///
+/// Re-opens FileReaders (using cached file metadata when warm) and rebuilds the
+/// storage layer from the pre-parsed quantizer metadata. No global buffers are
+/// re-read from object storage.
+pub async fn reconstruct_vector_index(
+    state: IvfIndexState,
+    object_store: Arc<ObjectStore>,
+    file_metadata_cache: &LanceCache,
+    index_cache: LanceCache,
+) -> Result<Arc<dyn VectorIndex>> {
+    match (state.sub_index_type.clone(), state.quantization_type) {
+        (SubIndexType::Flat, QuantizationType::Flat) => {
+            reconstruct_typed::<FlatIndex, FlatQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        (SubIndexType::Flat, QuantizationType::FlatBin) => {
+            reconstruct_typed::<FlatIndex, FlatBinQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        (SubIndexType::Flat, QuantizationType::Product) => {
+            reconstruct_typed::<FlatIndex, ProductQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        (SubIndexType::Flat, QuantizationType::Scalar) => {
+            reconstruct_typed::<FlatIndex, ScalarQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        (SubIndexType::Flat, QuantizationType::Rabit) => {
+            reconstruct_typed::<FlatIndex, RabitQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        (SubIndexType::Hnsw, QuantizationType::Flat) => {
+            reconstruct_typed::<HNSW, FlatQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        (SubIndexType::Hnsw, QuantizationType::Scalar) => {
+            reconstruct_typed::<HNSW, ScalarQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        (SubIndexType::Hnsw, QuantizationType::Product) => {
+            reconstruct_typed::<HNSW, ProductQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        (SubIndexType::Hnsw, QuantizationType::FlatBin) => {
+            reconstruct_typed::<HNSW, FlatBinQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        (sub, quant) => Err(Error::index(format!(
+            "unsupported index type combination for reconstruction: ({sub}, {quant})"
+        ))),
+    }
+}
+
+async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
+    state: IvfIndexState,
+    object_store: Arc<ObjectStore>,
+    file_metadata_cache: &LanceCache,
+    index_cache: LanceCache,
+) -> Result<Arc<dyn VectorIndex>>
+where
+    <Q::Storage as QuantizerStorage>::Metadata: serde::de::DeserializeOwned,
+{
+    let io_parallelism = object_store.io_parallelism();
+    let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
+    let scheduler = ScanScheduler::new(object_store, scheduler_config);
+
+    let index_path = Path::parse(&state.index_file_path)
+        .map_err(|e| Error::io(format!("invalid index path: {e}")))?;
+    let index_reader = open_reader_cached(
+        &scheduler,
+        &index_path,
+        file_metadata_cache,
+        state.index_file_size,
+    )
+    .await?;
+
+    // Derive aux path from the index path's parent directory.
+    let mut parts: Vec<_> = index_path.parts().collect();
+    parts.pop();
+    let dir: Path = parts.into_iter().collect();
+    let aux_path = dir.child(INDEX_AUXILIARY_FILE_NAME);
+    let aux_reader = open_reader_cached(
+        &scheduler,
+        &aux_path,
+        file_metadata_cache,
+        state.aux_file_size,
+    )
+    .await?;
+
+    let mut metadata: <<Q as Quantization>::Storage as QuantizerStorage>::Metadata =
+        serde_json::from_str(&state.quantizer_metadata_json)?;
+    if let Some(extra) = state.quantizer_extra_data {
+        metadata.parse_buffer(extra.into())?;
+    }
+
+    let storage = IvfQuantizationStorage::from_cached(
+        aux_reader,
+        state.aux_ivf.clone(),
+        metadata,
+        state.distance_type,
+        None,
+    );
+
+    let index = IVFIndex::<S, Q>::from_cached_state(
+        to_local_path(&index_path),
+        index_path.to_string(),
+        state.uuid,
+        state.ivf,
+        index_reader,
+        storage,
+        state.sub_index_metadata,
+        state.distance_type,
+        index_cache,
+        io_parallelism,
+    );
+    Ok(Arc::new(index))
+}
 
 #[cfg(test)]
 mod tests {
@@ -632,9 +931,11 @@ mod tests {
     use lance_index::vector::storage::VectorStore;
 
     use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
+    use crate::index::DatasetIndexExt;
     use crate::index::DatasetIndexInternalExt;
-    use crate::index::vector::ivf::finalize_distributed_merge;
+    use crate::index::IndexSegment;
     use crate::index::vector::ivf::v2::IvfPq;
+    use crate::index::vector::ivf::{build_segment, plan_segments};
     use crate::utils::test::copy_test_data_to_tmp;
     use crate::{
         Dataset,
@@ -650,6 +951,7 @@ mod tests {
     use lance_encoding::decoder::DecoderPlugins;
     use lance_file::reader::{FileReader, FileReaderOptions};
     use lance_file::writer::FileWriter;
+    use lance_index::IndexType;
     use lance_index::vector::DIST_COL;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
@@ -659,7 +961,6 @@ mod tests {
     use lance_index::vector::{
         pq::storage::ProductQuantizationMetadata, storage::STORAGE_METADATA_KEY,
     };
-    use lance_index::{DatasetIndexExt, IndexSegment, IndexType};
     use lance_index::{INDEX_AUXILIARY_FILE_NAME, metrics::NoOpMetricsCollector};
     use lance_index::{optimize::OptimizeOptions, scalar::IndexReader};
     use lance_index::{scalar::IndexWriter, vector::hnsw::builder::HnswBuildParams};
@@ -670,12 +971,12 @@ mod tests {
     };
     use lance_linalg::distance::{DistanceType, multivec_distance};
     use lance_linalg::kernels::normalize_fsl;
+    use lance_table::format::IndexMetadata;
     use lance_testing::datagen::{generate_random_array, generate_random_array_with_range};
     use object_store::path::Path;
     use rand::distr::uniform::SampleUniform;
     use rand::{Rng, SeedableRng, rngs::StdRng};
     use rstest::rstest;
-    use uuid::Uuid;
 
     const NUM_ROWS: usize = 512;
     const DIM: usize = 32;
@@ -1443,6 +1744,60 @@ mod tests {
         (ivf_params, pq_params)
     }
 
+    async fn prepare_global_ivf(dataset: &Dataset, vector_column: &str) -> IvfBuildParams {
+        let batch = dataset
+            .scan()
+            .project(&[vector_column.to_string()])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let vectors = batch
+            .column_by_name(vector_column)
+            .expect("vector column should exist")
+            .as_fixed_size_list();
+
+        let dim = vectors.value_length() as usize;
+        assert_eq!(dim, TWO_FRAG_DIM, "unexpected vector dimension");
+
+        let values = vectors.values().as_primitive::<Float32Type>();
+        let kmeans_params = KMeansParams::new(None, TWO_FRAG_MAX_ITERS, 1, DistanceType::L2);
+        let kmeans = train_kmeans::<Float32Type>(
+            values,
+            kmeans_params,
+            dim,
+            TWO_FRAG_NUM_PARTITIONS,
+            TWO_FRAG_SAMPLE_RATE,
+        )
+        .unwrap();
+
+        let centroids_flat = kmeans.centroids.as_primitive::<Float32Type>().clone();
+        let centroids_fsl =
+            Arc::new(FixedSizeListArray::try_new_from_values(centroids_flat, dim as i32).unwrap());
+        let mut ivf_params =
+            IvfBuildParams::try_with_centroids(TWO_FRAG_NUM_PARTITIONS, centroids_fsl).unwrap();
+        ivf_params.max_iters = TWO_FRAG_MAX_ITERS as usize;
+        ivf_params.sample_rate = TWO_FRAG_SAMPLE_RATE;
+        ivf_params
+    }
+
+    async fn build_segments_for_fragment_groups(
+        dataset: &mut Dataset,
+        fragment_groups: Vec<Vec<u32>>, // each group is a set of fragment ids
+        params: &VectorIndexParams,
+        index_name: &str,
+    ) -> Vec<IndexMetadata> {
+        let mut segments = Vec::new();
+
+        for fragments in fragment_groups {
+            let mut builder = dataset.create_index_builder(&["vector"], IndexType::Vector, params);
+            builder = builder.name(index_name.to_string()).fragments(fragments);
+            segments.push(builder.execute_uncommitted().await.unwrap());
+        }
+
+        segments
+    }
+
     async fn build_ivfpq_for_fragment_groups(
         dataset: &mut Dataset,
         fragment_groups: Vec<Vec<u32>>, // each group is a set of fragment ids
@@ -1450,52 +1805,23 @@ mod tests {
         pq_params: &PQBuildParams,
         index_name: &str,
     ) {
-        let shared_uuid = Uuid::new_v4();
         let params = VectorIndexParams::with_ivf_pq_params(
             DistanceType::L2,
             ivf_params.clone(),
             pq_params.clone(),
         );
 
-        for fragments in fragment_groups {
-            let mut builder = dataset.create_index_builder(&["vector"], IndexType::Vector, &params);
-            builder = builder
-                .name(index_name.to_string())
-                .fragments(fragments)
-                .index_uuid(shared_uuid.to_string());
-            // Build partial index shards without committing to manifest.
-            builder.execute_uncommitted().await.unwrap();
-        }
-
-        let index_dir = dataset.indices_dir().child(shared_uuid.to_string());
-        finalize_distributed_merge(dataset.object_store(), &index_dir, Some(IndexType::IvfPq))
-            .await
-            .unwrap();
-
-        dataset
-            .commit_existing_index_segments(
-                index_name,
-                "vector",
-                vec![IndexSegment::new(
-                    shared_uuid,
-                    dataset.fragment_bitmap.as_ref().clone(),
-                    Arc::new(crate::index::vector_index_details()),
-                    IndexType::IvfPq.version(),
-                )],
-            )
-            .await
-            .unwrap();
+        let segments =
+            build_segments_for_fragment_groups(dataset, fragment_groups, &params, index_name).await;
+        let built_segments = build_distributed_segments(dataset, &segments, None, index_name).await;
+        assert!(!built_segments.is_empty());
     }
 
-    fn assert_ivf_layout_equal(stats_a: &serde_json::Value, stats_b: &serde_json::Value) {
-        let idx_a = &stats_a["indices"][0];
-        let idx_b = &stats_b["indices"][0];
-
-        // Centroids: same shape and values (within tolerance).
-        let centroids_a = idx_a["centroids"]
+    fn assert_centroids_equal(reference: &serde_json::Value, candidate: &serde_json::Value) {
+        let centroids_a = reference["centroids"]
             .as_array()
             .expect("centroids should be an array");
-        let centroids_b = idx_b["centroids"]
+        let centroids_b = candidate["centroids"]
             .as_array()
             .expect("centroids should be an array");
         assert_eq!(
@@ -1522,29 +1848,204 @@ mod tests {
                 );
             }
         }
+    }
 
-        // Partitions sizes.
-        let parts_a = idx_a["partitions"]
+    fn sum_partition_sizes(indices: &[serde_json::Value]) -> Vec<u64> {
+        let mut totals = Vec::new();
+        for index in indices {
+            let partitions = index["partitions"]
+                .as_array()
+                .expect("partitions should be an array");
+            if totals.is_empty() {
+                totals.resize(partitions.len(), 0);
+            } else {
+                assert_eq!(totals.len(), partitions.len(), "num partitions mismatch");
+            }
+            for (total, partition) in totals.iter_mut().zip(partitions.iter()) {
+                *total += partition["size"].as_u64().expect("partition size");
+            }
+        }
+        totals
+    }
+
+    fn assert_ivf_layout_compatible(stats_a: &serde_json::Value, stats_b: &serde_json::Value) {
+        let indices_a = stats_a["indices"]
             .as_array()
-            .expect("partitions should be an array");
-        let parts_b = idx_b["partitions"]
+            .expect("indices should be an array");
+        let indices_b = stats_b["indices"]
             .as_array()
-            .expect("partitions should be an array");
-        assert_eq!(parts_a.len(), parts_b.len(), "num partitions mismatch");
-        let sizes_a: Vec<u64> = parts_a
-            .iter()
-            .map(|p| p["size"].as_u64().expect("partition size"))
-            .collect();
-        let sizes_b: Vec<u64> = parts_b
-            .iter()
-            .map(|p| p["size"].as_u64().expect("partition size"))
-            .collect();
-        assert_eq!(sizes_a, sizes_b, "partition sizes mismatch");
+            .expect("indices should be an array");
+        assert!(
+            !indices_a.is_empty() && !indices_b.is_empty(),
+            "indices should not be empty",
+        );
+
+        let reference = &indices_a[0];
+        for index in indices_a.iter().skip(1).chain(indices_b.iter()) {
+            assert_centroids_equal(reference, index);
+        }
+
+        let sizes_a = sum_partition_sizes(indices_a);
+        let sizes_b = sum_partition_sizes(indices_b);
+        assert_eq!(sizes_a, sizes_b, "aggregated partition sizes mismatch");
+    }
+
+    /// Execute the internal segment workflow used by the
+    /// regression tests: plan segment groups from caller-provided segment
+    /// metadata, build each segment, and publish them as one logical index.
+    async fn build_distributed_segments(
+        dataset: &mut Dataset,
+        segments: &[IndexMetadata],
+        target_segment_bytes: Option<u64>,
+        index_name: &str,
+    ) -> Vec<IndexSegment> {
+        let segment_plans = plan_segments(segments, None, target_segment_bytes)
+            .await
+            .unwrap();
+        let mut built_segments = Vec::with_capacity(segment_plans.len());
+        for plan in &segment_plans {
+            built_segments.push(
+                build_segment(dataset.object_store(), &dataset.indices_dir(), plan)
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments(index_name, "vector", built_segments.clone())
+            .await
+            .unwrap();
+
+        built_segments
     }
 
     #[tokio::test]
     async fn test_ivfpq_recall_performance_on_two_frags_single_vs_split() {
         const INDEX_NAME: &str = "vector_idx";
+
+        let test_dir = TempStrDir::default();
+        let base_uri = test_dir.as_str();
+
+        let (schema, batches) = make_two_fragment_batches();
+
+        let ds_single_uri = format!("{}/single", base_uri);
+        let ds_split_uri = format!("{}/split", base_uri);
+
+        let mut ds_single =
+            write_dataset_from_batches(&ds_single_uri, schema.clone(), batches.clone()).await;
+        let mut ds_split = write_dataset_from_batches(&ds_split_uri, schema, batches).await;
+
+        let fragments_single = ds_single.get_fragments();
+        assert!(
+            fragments_single.len() >= 2,
+            "expected at least 2 fragments in ds_single, got {}",
+            fragments_single.len()
+        );
+        let fragments_split = ds_split.get_fragments();
+        assert!(
+            fragments_split.len() >= 2,
+            "expected at least 2 fragments in ds_split, got {}",
+            fragments_split.len()
+        );
+
+        let (ivf_params, pq_params) = prepare_global_ivf_pq(&ds_single, "vector").await;
+
+        let group_single = vec![
+            fragments_single[0].id() as u32,
+            fragments_single[1].id() as u32,
+        ];
+        build_ivfpq_for_fragment_groups(
+            &mut ds_single,
+            vec![group_single],
+            &ivf_params,
+            &pq_params,
+            INDEX_NAME,
+        )
+        .await;
+
+        let group0 = vec![fragments_split[0].id() as u32];
+        let group1 = vec![fragments_split[1].id() as u32];
+        build_ivfpq_for_fragment_groups(
+            &mut ds_split,
+            vec![group0, group1],
+            &ivf_params,
+            &pq_params,
+            INDEX_NAME,
+        )
+        .await;
+
+        let stats_single_json = ds_single.index_statistics(INDEX_NAME).await.unwrap();
+        let stats_split_json = ds_split.index_statistics(INDEX_NAME).await.unwrap();
+        let stats_single: serde_json::Value = serde_json::from_str(&stats_single_json).unwrap();
+        let stats_split: serde_json::Value = serde_json::from_str(&stats_split_json).unwrap();
+        assert_ivf_layout_compatible(&stats_single, &stats_split);
+        assert_eq!(
+            stats_single["num_indexed_rows"],
+            stats_split["num_indexed_rows"]
+        );
+
+        const K: usize = 10;
+        const NUM_QUERIES: usize = 10;
+
+        async fn collect_row_ids(ds: &Dataset, queries: &[Arc<dyn Array>]) -> Vec<Vec<u64>> {
+            let mut ids_per_query = Vec::with_capacity(queries.len());
+            for q in queries {
+                let result = ds
+                    .scan()
+                    .with_row_id()
+                    .project(&["_rowid"] as &[&str])
+                    .unwrap()
+                    .nearest("vector", q.as_ref(), K)
+                    .unwrap()
+                    .minimum_nprobes(TWO_FRAG_NUM_PARTITIONS)
+                    .try_into_batch()
+                    .await
+                    .unwrap();
+
+                let row_ids = result[ROW_ID]
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<u64>>();
+                ids_per_query.push(row_ids);
+            }
+            ids_per_query
+        }
+
+        let query_batch = ds_single
+            .scan()
+            .project(&["vector"] as &[&str])
+            .unwrap()
+            .limit(Some(NUM_QUERIES as i64), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let vectors = query_batch["vector"].as_fixed_size_list();
+        let queries: Vec<Arc<dyn Array>> = (0..vectors.len())
+            .map(|i| vectors.value(i) as Arc<dyn Array>)
+            .collect();
+
+        let ids_single = collect_row_ids(&ds_single, &queries).await;
+        let ids_split = collect_row_ids(&ds_split, &queries).await;
+
+        assert_eq!(
+            ids_single, ids_split,
+            "single vs split index returned different Top-K row ids",
+        );
+    }
+
+    #[rstest]
+    #[case::ivf_flat(IndexType::IvfFlat)]
+    #[case::ivf_pq(IndexType::IvfPq)]
+    #[case::ivf_sq(IndexType::IvfSq)]
+    #[tokio::test]
+    async fn test_distributed_vector_build_commits_multiple_segments_and_preserves_query_results(
+        #[case] index_type: IndexType,
+    ) {
+        const INDEX_NAME: &str = "vector_idx";
+        const K: usize = 10;
+        const NUM_QUERIES: usize = 10;
 
         let test_dir = TempStrDir::default();
         let base_uri = test_dir.as_str();
@@ -1573,66 +2074,76 @@ mod tests {
             fragments_split.len()
         );
 
-        // Pretrain global IVF centroids and PQ codebook.
-        let (ivf_params, pq_params) = prepare_global_ivf_pq(&ds_single, "vector").await;
+        let distributed_params = match index_type {
+            IndexType::IvfFlat => {
+                let ivf_params = prepare_global_ivf(&ds_single, "vector").await;
+                VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf_params)
+            }
+            IndexType::IvfPq => {
+                let (ivf_params, pq_params) = prepare_global_ivf_pq(&ds_single, "vector").await;
+                VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params)
+            }
+            IndexType::IvfSq => {
+                let ivf_params = prepare_global_ivf(&ds_single, "vector").await;
+                VectorIndexParams::with_ivf_sq_params(
+                    DistanceType::L2,
+                    ivf_params,
+                    SQBuildParams::default(),
+                )
+            }
+            other => panic!("unsupported test index type: {}", other),
+        };
 
-        // Build single index using two fragments in one distributed build.
-        let group_single = vec![
-            fragments_single[0].id() as u32,
-            fragments_single[1].id() as u32,
-        ];
-        build_ivfpq_for_fragment_groups(
-            &mut ds_single,
-            vec![group_single],
-            &ivf_params,
-            &pq_params,
-            INDEX_NAME,
-        )
-        .await;
+        ds_single
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_string()),
+                &distributed_params,
+                true,
+            )
+            .await
+            .unwrap();
 
-        // Build split index: one fragment per distributed build, then merge.
-        let group0 = vec![fragments_split[0].id() as u32];
-        let group1 = vec![fragments_split[1].id() as u32];
-        build_ivfpq_for_fragment_groups(
+        let fragment_groups = fragments_split
+            .iter()
+            .map(|fragment| vec![fragment.id() as u32])
+            .collect::<Vec<_>>();
+        let expected_segment_count = fragment_groups.len();
+        let segments = build_segments_for_fragment_groups(
             &mut ds_split,
-            vec![group0, group1],
-            &ivf_params,
-            &pq_params,
+            fragment_groups,
+            &distributed_params,
             INDEX_NAME,
         )
         .await;
-
-        // Compare IVF layout via index statistics.
-        let stats_single_json = ds_single.index_statistics(INDEX_NAME).await.unwrap();
-        let stats_split_json = ds_split.index_statistics(INDEX_NAME).await.unwrap();
-        let stats_single: serde_json::Value = serde_json::from_str(&stats_single_json).unwrap();
-        let stats_split: serde_json::Value = serde_json::from_str(&stats_split_json).unwrap();
-        assert_ivf_layout_equal(&stats_single, &stats_split);
-
-        // Compare row id sets per partition.
-        let ctx_single = load_vector_index_context(&ds_single, "vector", INDEX_NAME).await;
-        let ctx_split = load_vector_index_context(&ds_split, "vector", INDEX_NAME).await;
-
-        let ivf_single = ctx_single.ivf();
-        let ivf_split = ctx_split.ivf();
-        let total_partitions = ivf_single.total_partitions();
-        assert_eq!(total_partitions, ivf_split.total_partitions());
-
-        for part_id in 0..total_partitions {
-            let row_ids_single = load_partition_row_ids(ivf_single, part_id).await;
-            let row_ids_split = load_partition_row_ids(ivf_split, part_id).await;
-            let set_single: HashSet<u64> = row_ids_single.into_iter().collect();
-            let set_split: HashSet<u64> = row_ids_split.into_iter().collect();
-            assert_eq!(
-                set_single, set_split,
-                "row id set mismatch for partition {}",
-                part_id
+        let segments = build_distributed_segments(&mut ds_split, &segments, None, INDEX_NAME).await;
+        assert_eq!(segments.len(), expected_segment_count);
+        for segment in &segments {
+            let segment_index = ds_split
+                .indices_dir()
+                .child(segment.uuid().to_string())
+                .child(crate::index::INDEX_FILE_NAME);
+            assert!(
+                ds_split
+                    .object_store()
+                    .exists(&segment_index)
+                    .await
+                    .unwrap(),
+                "segment file should exist at {}",
+                segment_index
             );
         }
 
-        // Compare Top-K row ids on a deterministic set of queries.
-        const K: usize = 10;
-        const NUM_QUERIES: usize = 10;
+        let committed_segments = ds_split.load_indices_by_name(INDEX_NAME).await.unwrap();
+        assert_eq!(committed_segments.len(), expected_segment_count);
+        for committed in committed_segments {
+            let covered_fragments = committed
+                .fragment_bitmap
+                .as_ref()
+                .expect("distributed segment should have fragment coverage");
+            assert_eq!(covered_fragments.len(), 1);
+        }
 
         async fn collect_row_ids(ds: &Dataset, queries: &[Arc<dyn Array>]) -> Vec<Vec<u64>> {
             let mut ids_per_query = Vec::with_capacity(queries.len());
@@ -1644,6 +2155,7 @@ mod tests {
                     .unwrap()
                     .nearest("vector", q.as_ref(), K)
                     .unwrap()
+                    .minimum_nprobes(TWO_FRAG_NUM_PARTITIONS)
                     .try_into_batch()
                     .await
                     .unwrap();
@@ -1679,10 +2191,240 @@ mod tests {
 
         assert_eq!(
             ids_single, ids_split,
-            "single vs split index returned different Top-K row ids",
+            "single vs segmented distributed index returned different Top-K row ids",
         );
     }
 
+    #[rstest]
+    #[case::ivf_flat(IndexType::IvfFlat)]
+    #[case::ivf_pq(IndexType::IvfPq)]
+    #[case::ivf_sq(IndexType::IvfSq)]
+    #[tokio::test]
+    async fn test_distributed_vector_grouped_build_allows_concurrent_group_execution(
+        #[case] index_type: IndexType,
+    ) {
+        const INDEX_NAME: &str = "grouped_idx";
+        const K: usize = 10;
+        const NUM_QUERIES: usize = 10;
+
+        let test_dir = TempStrDir::default();
+        let base_uri = test_dir.as_str();
+
+        let (schema, batches) = make_two_fragment_batches();
+        let ds_single_uri = format!("{}/grouped_single", base_uri);
+        let ds_split_uri = format!("{}/grouped_split", base_uri);
+
+        let mut ds_single =
+            write_dataset_from_batches(&ds_single_uri, schema.clone(), batches.clone()).await;
+        let mut ds_split = write_dataset_from_batches(&ds_split_uri, schema, batches).await;
+
+        let distributed_params = match index_type {
+            IndexType::IvfFlat => {
+                let ivf_params = prepare_global_ivf(&ds_single, "vector").await;
+                VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf_params)
+            }
+            IndexType::IvfPq => {
+                let (ivf_params, pq_params) = prepare_global_ivf_pq(&ds_single, "vector").await;
+                VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params)
+            }
+            IndexType::IvfSq => {
+                let ivf_params = prepare_global_ivf(&ds_single, "vector").await;
+                VectorIndexParams::with_ivf_sq_params(
+                    DistanceType::L2,
+                    ivf_params,
+                    SQBuildParams::default(),
+                )
+            }
+            other => panic!("unsupported test index type: {}", other),
+        };
+
+        ds_single
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_string()),
+                &distributed_params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let fragment_groups = ds_split
+            .get_fragments()
+            .into_iter()
+            .map(|fragment| vec![fragment.id() as u32])
+            .collect::<Vec<_>>();
+        let segments = build_segments_for_fragment_groups(
+            &mut ds_split,
+            fragment_groups,
+            &distributed_params,
+            INDEX_NAME,
+        )
+        .await;
+
+        let shard_plan = plan_segments(&segments, None, None).await.unwrap();
+        let shard_count = shard_plan.len();
+        assert!(shard_count >= 4);
+        let target_segment_bytes = shard_plan[0].estimated_bytes().saturating_mul(2);
+
+        let grouped_plan = plan_segments(&segments, None, Some(target_segment_bytes))
+            .await
+            .unwrap();
+        assert!(grouped_plan.len() < shard_count);
+        assert!(grouped_plan.iter().any(|plan| plan.segments().len() > 1));
+
+        let grouped_segments = build_distributed_segments(
+            &mut ds_split,
+            &segments,
+            Some(target_segment_bytes),
+            INDEX_NAME,
+        )
+        .await;
+        assert_eq!(grouped_segments.len(), grouped_plan.len());
+
+        async fn collect_row_ids(ds: &Dataset, queries: &[Arc<dyn Array>]) -> Vec<Vec<u64>> {
+            let mut ids_per_query = Vec::with_capacity(queries.len());
+            for q in queries {
+                let result = ds
+                    .scan()
+                    .with_row_id()
+                    .project(&["_rowid"] as &[&str])
+                    .unwrap()
+                    .nearest("vector", q.as_ref(), K)
+                    .unwrap()
+                    .minimum_nprobes(TWO_FRAG_NUM_PARTITIONS)
+                    .try_into_batch()
+                    .await
+                    .unwrap();
+
+                ids_per_query.push(
+                    result[ROW_ID]
+                        .as_primitive::<UInt64Type>()
+                        .values()
+                        .iter()
+                        .copied()
+                        .collect(),
+                );
+            }
+            ids_per_query
+        }
+
+        let query_batch = ds_single
+            .scan()
+            .project(&["vector"] as &[&str])
+            .unwrap()
+            .limit(Some(NUM_QUERIES as i64), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let vectors = query_batch["vector"].as_fixed_size_list();
+        let queries: Vec<Arc<dyn Array>> = (0..vectors.len())
+            .map(|i| vectors.value(i) as Arc<dyn Array>)
+            .collect();
+
+        let ids_single = collect_row_ids(&ds_single, &queries).await;
+        let ids_split = collect_row_ids(&ds_split, &queries).await;
+        assert_eq!(ids_single, ids_split);
+    }
+
+    #[tokio::test]
+    async fn test_distributed_vector_plan_rejects_overlapping_fragment_coverage() {
+        let test_dir = TempStrDir::default();
+        let base_uri = test_dir.as_str();
+        let (schema, batches) = make_two_fragment_batches();
+        let dataset_uri = format!("{}/overlap_fragments", base_uri);
+        let mut dataset = write_dataset_from_batches(&dataset_uri, schema, batches).await;
+
+        let fragment = dataset.get_fragments()[0].id() as u32;
+        let params = VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            prepare_global_ivf(&dataset, "vector").await,
+        );
+        let mut segments = Vec::new();
+
+        for _ in 0..2 {
+            let segment = dataset
+                .create_index_builder(&["vector"], IndexType::Vector, &params)
+                .name("vector_idx".to_string())
+                .fragments(vec![fragment])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+            segments.push(segment);
+        }
+
+        let err = plan_segments(&segments, None, None).await.unwrap_err();
+        assert!(err.to_string().contains("overlapping fragment coverage"));
+    }
+
+    #[tokio::test]
+    async fn test_distributed_vector_build_supports_hnsw_variants() {
+        let test_dir = TempStrDir::default();
+        let base_uri = test_dir.as_str();
+        let (schema, batches) = make_two_fragment_batches();
+        let dataset_uri = format!("{}/distributed_hnsw_supported", base_uri);
+        let mut dataset = write_dataset_from_batches(&dataset_uri, schema, batches).await;
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() >= 2);
+        let params = VectorIndexParams::ivf_hnsw(
+            DistanceType::L2,
+            prepare_global_ivf(&dataset, "vector").await,
+            HnswBuildParams::default(),
+        );
+        let mut segments = Vec::new();
+
+        for fragment in fragments.iter().take(2) {
+            let segment = dataset
+                .create_index_builder(&["vector"], IndexType::Vector, &params)
+                .name("vector_idx".to_string())
+                .fragments(vec![fragment.id() as u32])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+            segments.push(segment);
+        }
+
+        let plans = plan_segments(&segments, None, Some(1)).await.unwrap();
+        assert_eq!(plans.len(), fragments.iter().take(2).count());
+
+        let mut segments = Vec::with_capacity(plans.len());
+        for plan in &plans {
+            segments.push(
+                build_segment(dataset.object_store(), &dataset.indices_dir(), plan)
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(segments.len(), plans.len());
+
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", segments)
+            .await
+            .unwrap();
+
+        let query_batch = dataset
+            .scan()
+            .project(&["vector"] as &[&str])
+            .unwrap()
+            .limit(Some(4), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let q = query_batch["vector"].as_fixed_size_list().value(0);
+        let result = dataset
+            .scan()
+            .project(&["_rowid"] as &[&str])
+            .unwrap()
+            .nearest("vector", q.as_ref(), 5)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(result.num_rows() > 0);
+    }
     async fn test_index(
         params: VectorIndexParams,
         nlist: usize,

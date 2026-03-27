@@ -445,6 +445,93 @@ impl CacheStats {
     }
 }
 
+// ---------------------------------------------------------------------------
+// CacheCodec — streaming serialization for cache entries
+// ---------------------------------------------------------------------------
+
+/// Writer wrapper that counts bytes written through it.
+pub struct CountingWriter<'a> {
+    inner: &'a mut dyn std::io::Write,
+    written: usize,
+}
+
+impl<'a> CountingWriter<'a> {
+    pub fn new(inner: &'a mut dyn std::io::Write) -> Self {
+        Self { inner, written: 0 }
+    }
+
+    pub fn written(&self) -> usize {
+        self.written
+    }
+}
+
+impl std::io::Write for CountingWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.written += n;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Streaming serialization codec for cache entries.
+///
+/// `serialize` streams the entry into the provided writer and returns the
+/// number of bytes written. `deserialize` reconstructs the entry by reading
+/// sequentially from the provided reader.
+///
+/// `type_tag` returns a static string that identifies the concrete type,
+/// enabling dispatch to the correct deserializer when working through trait
+/// objects (where `deserialize` is unavailable due to the `Sized` bound).
+pub trait CacheCodec: Send + Sync {
+    fn serialize(&self, writer: &mut dyn std::io::Write) -> crate::Result<usize>;
+    fn type_tag(&self) -> &'static str;
+    fn deserialize(reader: &mut dyn std::io::Read) -> crate::Result<Self>
+    where
+        Self: Sized;
+}
+
+/// Write a [`CacheCodec`] value with a leading type tag for later dispatch.
+///
+/// Wire format: `[tag_len: u16 LE][tag: UTF-8 bytes][payload via CacheCodec::serialize]`
+pub fn serialize_tagged(
+    value: &dyn CacheCodec,
+    writer: &mut dyn std::io::Write,
+) -> crate::Result<usize> {
+    let tag = value.type_tag();
+    let tag_bytes = tag.as_bytes();
+    let tag_len = tag_bytes.len() as u16;
+    writer
+        .write_all(&tag_len.to_le_bytes())
+        .map_err(|e| crate::Error::io(e.to_string()))?;
+    writer
+        .write_all(tag_bytes)
+        .map_err(|e| crate::Error::io(e.to_string()))?;
+    let payload = value.serialize(writer)?;
+    Ok(2 + tag_bytes.len() + payload)
+}
+
+/// Read the type tag written by [`serialize_tagged`].
+///
+/// Returns the tag string. The reader is left positioned at the start of the
+/// payload, ready for [`CacheCodec::deserialize`].
+pub fn read_type_tag(reader: &mut dyn std::io::Read) -> crate::Result<String> {
+    let mut len_buf = [0u8; 2];
+    reader
+        .read_exact(&mut len_buf)
+        .map_err(|e| crate::Error::io(e.to_string()))?;
+    let tag_len = u16::from_le_bytes(len_buf) as usize;
+    let mut tag_buf = vec![0u8; tag_len];
+    reader
+        .read_exact(&mut tag_buf)
+        .map_err(|e| crate::Error::io(e.to_string()))?;
+    String::from_utf8(tag_buf)
+        .map_err(|e| crate::Error::io(format!("CacheCodec type tag is not valid UTF-8: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
