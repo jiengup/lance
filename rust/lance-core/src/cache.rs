@@ -349,6 +349,11 @@ impl WeakLanceCache {
         }
     }
 
+    /// The key prefix assigned to this cache view.
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
     /// Appends a prefix to the cache key
     pub fn with_key_prefix(&self, prefix: &str) -> Self {
         Self {

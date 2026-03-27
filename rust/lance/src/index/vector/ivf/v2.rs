@@ -26,18 +26,23 @@ use lance_core::utils::tokio::spawn_cpu;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::reader::{FileReader, FileReaderOptions};
+use lance_file::LanceEncodingsIo;
+use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions};
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::{LocalMetricsCollector, MetricsCollector, NoOpMetricsCollector};
 use lance_index::vector::VectorIndexCacheEntry;
-use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
+use lance_index::vector::bq::builder::RabitQuantizer;
+use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::ProductQuantizer;
-use lance_index::vector::quantizer::{QuantizationType, Quantizer};
+use lance_index::vector::quantizer::{
+    QuantizationType, Quantizer, QuantizerMetadata, QuantizerStorage,
+};
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::storage::VectorStore;
 use lance_index::vector::v3::subindex::SubIndexType;
+use lance_index::vector::{IvfIndexState, VectorIndexData};
 use lance_index::{
     INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, Index, IndexType, pb,
     vector::{
@@ -59,6 +64,55 @@ use roaring::RoaringBitmap;
 use tracing::{info, instrument};
 
 use super::{IvfIndexPartitionStatistics, IvfIndexStatistics, centroids_to_vectors};
+
+struct FileMetadataCacheKey;
+
+impl CacheKey for FileMetadataCacheKey {
+    type ValueType = CachedFileMetadata;
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        "".into()
+    }
+}
+
+/// Open a FileReader, reusing cached file metadata if available.
+async fn open_reader_cached(
+    scheduler: &Arc<ScanScheduler>,
+    path: &Path,
+    cache: &LanceCache,
+    known_file_size: u64,
+) -> Result<FileReader> {
+    let file_cache = cache.with_key_prefix(path.as_ref());
+    let cached_size = if known_file_size > 0 {
+        CachedFileSize::new(known_file_size)
+    } else {
+        CachedFileSize::unknown()
+    };
+
+    if let Some(cached_meta) = file_cache.get_with_key(&FileMetadataCacheKey).await {
+        let file_scheduler = scheduler.open_file(path, &cached_size).await?;
+        let encodings_io = Arc::new(LanceEncodingsIo::new(file_scheduler));
+        FileReader::try_open_with_file_metadata(
+            encodings_io,
+            path.clone(),
+            None,
+            Arc::<DecoderPlugins>::default(),
+            cached_meta,
+            cache,
+            FileReaderOptions::default(),
+        )
+        .await
+    } else {
+        let file_scheduler = scheduler.open_file(path, &cached_size).await?;
+        FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            cache,
+            FileReaderOptions::default(),
+        )
+        .await
+    }
+}
 
 #[derive(Debug, DeepSizeOf)]
 pub struct PartitionEntry<S: IvfSubIndex, Q: Quantization> {
@@ -210,6 +264,20 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let storage =
             IvfQuantizationStorage::try_new(storage_reader, frag_reuse_index.clone()).await?;
 
+        // Cache file metadata so reconstructions from IvfIndexState can skip
+        // footer reads.
+        file_metadata_cache
+            .with_key_prefix(uri.as_ref())
+            .insert_with_key(&FileMetadataCacheKey, index_reader.metadata().clone())
+            .await;
+        let aux_path = index_dir
+            .child(uuid.as_str())
+            .child(INDEX_AUXILIARY_FILE_NAME);
+        file_metadata_cache
+            .with_key_prefix(aux_path.as_ref())
+            .insert_with_key(&FileMetadataCacheKey, storage.reader().metadata().clone())
+            .await;
+
         let num_partitions = ivf.num_partitions();
         Ok(Self {
             uri: to_local_path(&uri),
@@ -224,6 +292,35 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             io_parallelism,
             _marker: PhantomData,
         })
+    }
+
+    /// Reconstruct an IVFIndex from pre-parsed state without any I/O.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_cached_state(
+        uri: String,
+        uuid: String,
+        ivf: IvfModel,
+        reader: FileReader,
+        storage: IvfQuantizationStorage<Q>,
+        sub_index_metadata: Vec<String>,
+        distance_type: DistanceType,
+        index_cache: LanceCache,
+        io_parallelism: usize,
+    ) -> Self {
+        let num_partitions = ivf.num_partitions();
+        Self {
+            uri,
+            uuid,
+            ivf,
+            reader,
+            storage,
+            partition_locks: PartitionLoadLock::new(num_partitions),
+            sub_index_metadata,
+            distance_type,
+            index_cache: WeakLanceCache::from(&index_cache),
+            io_parallelism,
+            _marker: PhantomData,
+        }
     }
 
     #[instrument(level = "debug", skip(self, metrics))]
@@ -599,12 +696,191 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
     fn metric_type(&self) -> DistanceType {
         self.distance_type
     }
+
+    fn cacheable_state(&self) -> Option<Box<dyn VectorIndexData>> {
+        let quantizer_metadata_json = serde_json::to_string(self.storage.metadata()).ok()?;
+        let quantizer_extra_data = self
+            .storage
+            .metadata()
+            .extra_metadata()
+            .ok()?
+            .map(|b| b.to_vec());
+        let (sub_index_type, quantization_type) = self.sub_index_type();
+        Some(Box::new(IvfIndexState {
+            index_file_path: self.uri.clone(),
+            uuid: self.uuid.clone(),
+            ivf: self.ivf.clone(),
+            aux_ivf: self.storage.ivf().clone(),
+            distance_type: self.distance_type,
+            sub_index_metadata: self.sub_index_metadata.clone(),
+            quantizer_metadata_json,
+            quantizer_extra_data,
+            sub_index_type,
+            quantization_type,
+            cache_key_prefix: self.index_cache.prefix().to_string(),
+            index_file_size: self.reader.metadata().file_size(),
+            aux_file_size: self.storage.reader().metadata().file_size(),
+        }))
+    }
 }
 
 pub type IvfFlatIndex = IVFIndex<FlatIndex, FlatQuantizer>;
 pub type IvfPq = IVFIndex<FlatIndex, ProductQuantizer>;
 pub type IvfHnswSqIndex = IVFIndex<HNSW, ScalarQuantizer>;
 pub type IvfHnswPqIndex = IVFIndex<HNSW, ProductQuantizer>;
+
+/// Reconstruct a live [`VectorIndex`] from a cached [`IvfIndexState`].
+///
+/// Re-opens FileReaders (using cached file metadata when warm) and rebuilds the
+/// storage layer from the pre-parsed quantizer metadata. No global buffers are
+/// re-read from object storage.
+pub async fn reconstruct_vector_index(
+    state: IvfIndexState,
+    object_store: Arc<ObjectStore>,
+    file_metadata_cache: &LanceCache,
+    index_cache: LanceCache,
+) -> Result<Arc<dyn VectorIndex>> {
+    match (state.sub_index_type, state.quantization_type) {
+        (SubIndexType::Flat, QuantizationType::Flat) => {
+            reconstruct_typed::<FlatIndex, FlatQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        (SubIndexType::Flat, QuantizationType::FlatBin) => {
+            reconstruct_typed::<FlatIndex, FlatBinQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        (SubIndexType::Flat, QuantizationType::Product) => {
+            reconstruct_typed::<FlatIndex, ProductQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        (SubIndexType::Flat, QuantizationType::Scalar) => {
+            reconstruct_typed::<FlatIndex, ScalarQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        (SubIndexType::Flat, QuantizationType::Rabit) => {
+            reconstruct_typed::<FlatIndex, RabitQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        (SubIndexType::Hnsw, QuantizationType::Flat) => {
+            reconstruct_typed::<HNSW, FlatQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        (SubIndexType::Hnsw, QuantizationType::Scalar) => {
+            reconstruct_typed::<HNSW, ScalarQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        (SubIndexType::Hnsw, QuantizationType::Product) => {
+            reconstruct_typed::<HNSW, ProductQuantizer>(
+                state,
+                object_store,
+                file_metadata_cache,
+                index_cache,
+            )
+            .await
+        }
+        (sub, quant) => Err(Error::index(format!(
+            "unsupported index type combination for reconstruction: ({sub}, {quant})"
+        ))),
+    }
+}
+
+async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
+    state: IvfIndexState,
+    object_store: Arc<ObjectStore>,
+    file_metadata_cache: &LanceCache,
+    index_cache: LanceCache,
+) -> Result<Arc<dyn VectorIndex>>
+where
+    <Q::Storage as QuantizerStorage>::Metadata: serde::de::DeserializeOwned,
+{
+    let io_parallelism = object_store.io_parallelism();
+    let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
+    let scheduler = ScanScheduler::new(object_store, scheduler_config);
+
+    let index_path: Path = state.index_file_path.as_str().into();
+    let index_reader = open_reader_cached(
+        &scheduler,
+        &index_path,
+        file_metadata_cache,
+        state.index_file_size,
+    )
+    .await?;
+
+    // Derive aux path from the index path's parent directory.
+    let mut parts: Vec<_> = index_path.parts().collect();
+    parts.pop();
+    let dir: Path = parts.into_iter().collect();
+    let aux_path = dir.child(INDEX_AUXILIARY_FILE_NAME);
+    let aux_reader = open_reader_cached(
+        &scheduler,
+        &aux_path,
+        file_metadata_cache,
+        state.aux_file_size,
+    )
+    .await?;
+
+    let mut metadata: <<Q as Quantization>::Storage as QuantizerStorage>::Metadata =
+        serde_json::from_str(&state.quantizer_metadata_json)?;
+    if let Some(extra) = state.quantizer_extra_data {
+        metadata.parse_buffer(extra.into())?;
+    }
+
+    let storage = IvfQuantizationStorage::from_cached(
+        aux_reader,
+        state.aux_ivf.clone(),
+        metadata,
+        state.distance_type,
+        None,
+    );
+
+    let index = IVFIndex::<S, Q>::from_cached_state(
+        to_local_path(&index_path),
+        state.uuid,
+        state.ivf,
+        index_reader,
+        storage,
+        state.sub_index_metadata,
+        state.distance_type,
+        index_cache,
+        io_parallelism,
+    );
+    Ok(Arc::new(index))
+}
 
 #[cfg(test)]
 mod tests {

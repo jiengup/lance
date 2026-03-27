@@ -43,6 +43,7 @@ use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantize
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::sq::ScalarQuantizer;
+use lance_index::vector::{IvfIndexState, VectorIndexData};
 use lance_index::{INDEX_FILE_NAME, Index, IndexType, pb, vector::VectorIndex};
 use lance_index::{
     IndexCriteria, is_system_index,
@@ -179,7 +180,7 @@ impl<'a> VectorIndexCacheKey<'a> {
 }
 
 impl UnsizedCacheKey for VectorIndexCacheKey<'_> {
-    type ValueType = dyn VectorIndex;
+    type ValueType = dyn VectorIndexData;
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
         if let Some(fri_uuid) = self.fri_uuid {
@@ -187,6 +188,40 @@ impl UnsizedCacheKey for VectorIndexCacheKey<'_> {
         } else {
             self.uuid.into()
         }
+    }
+}
+
+/// Wrapper that stores a live VectorIndex in the VectorIndexData cache slot.
+/// Used for v0.1/v0.2 indices that don't support `cacheable_state()`.
+#[derive(Debug)]
+struct CachedLegacyVectorIndex(Arc<dyn VectorIndex>);
+
+impl deepsize::DeepSizeOf for CachedLegacyVectorIndex {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        // Small fixed overhead; the real data lives behind Arc and is shared.
+        1024
+    }
+}
+
+impl lance_core::cache::CacheCodec for CachedLegacyVectorIndex {
+    fn serialize(&self, _writer: &mut dyn std::io::Write) -> lance_core::Result<usize> {
+        Err(lance_core::Error::internal(
+            "Legacy IVF indices cannot be serialized",
+        ))
+    }
+    fn type_tag(&self) -> &'static str {
+        "LegacyIVF"
+    }
+    fn deserialize(_reader: &mut dyn std::io::Read) -> lance_core::Result<Self> {
+        Err(lance_core::Error::internal(
+            "Legacy IVF indices cannot be deserialized",
+        ))
+    }
+}
+
+impl VectorIndexData for CachedLegacyVectorIndex {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -1364,11 +1399,17 @@ impl DatasetIndexInternalExt for Dataset {
         }
 
         let vector_cache_key = VectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if let Some(index) = self
+        if let Some(data) = self
             .index_cache
             .get_unsized_with_key(&vector_cache_key)
             .await
         {
+            if let Some(cached) = data.as_any().downcast_ref::<CachedLegacyVectorIndex>() {
+                return Ok(cached.0.clone().as_index());
+            }
+            // For IvfIndexState, do a full reconstruct via open_vector_index
+            // which will hit the same cache key and reconstruct.
+            let index = self.open_vector_index(column, uuid, metrics).await?;
             return Ok(index.as_index());
         }
 
@@ -1446,9 +1487,24 @@ impl DatasetIndexInternalExt for Dataset {
         let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
         let cache_key = VectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
 
-        if let Some(index) = self.index_cache.get_unsized_with_key(&cache_key).await {
-            log::debug!("Found vector index in cache uuid: {}", uuid);
-            return Ok(index);
+        if let Some(data) = self.index_cache.get_unsized_with_key(&cache_key).await {
+            log::debug!("Found vector index data in cache uuid: {}", uuid);
+            if let Some(state) = data.as_any().downcast_ref::<IvfIndexState>() {
+                let partition_cache = self.index_cache.with_key_prefix(&cache_key.key());
+                return vector::ivf::v2::reconstruct_vector_index(
+                    state.clone(),
+                    self.object_store.clone(),
+                    self.metadata_cache.as_ref(),
+                    partition_cache,
+                )
+                .await;
+            } else if let Some(cached) = data.as_any().downcast_ref::<CachedLegacyVectorIndex>() {
+                return Ok(cached.0.clone());
+            }
+            return Err(Error::internal(format!(
+                "unexpected VectorIndexData type in cache for uuid: {}",
+                uuid
+            )));
         }
 
         let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
@@ -1675,9 +1731,16 @@ impl DatasetIndexInternalExt for Dataset {
         };
         let index = index?;
         metrics.record_index_load();
-        self.index_cache
-            .insert_unsized_with_key(&cache_key, index.clone())
-            .await;
+        if let Some(state) = index.cacheable_state() {
+            self.index_cache
+                .insert_unsized_with_key(&cache_key, Arc::from(state))
+                .await;
+        } else {
+            let cached: Arc<dyn VectorIndexData> = Arc::new(CachedLegacyVectorIndex(index.clone()));
+            self.index_cache
+                .insert_unsized_with_key(&cache_key, cached)
+                .await;
+        }
         Ok(index)
     }
 
