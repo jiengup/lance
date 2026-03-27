@@ -286,7 +286,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let num_partitions = ivf.num_partitions();
         Ok(Self {
             uri: to_local_path(&uri),
-            index_path: uri.to_string(),
+            index_path: uri.as_ref().to_string(),
             uuid,
             ivf,
             reader: index_reader,
@@ -840,7 +840,8 @@ where
     let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
     let scheduler = ScanScheduler::new(object_store, scheduler_config);
 
-    let index_path: Path = state.index_file_path.as_str().into();
+    let index_path = Path::parse(&state.index_file_path)
+        .map_err(|e| Error::io(format!("invalid index path: {e}")))?;
     let index_reader = open_reader_cached(
         &scheduler,
         &index_path,
