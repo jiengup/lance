@@ -39,6 +39,7 @@ from pyarrow import RecordBatch, Schema
 from lance.log import LOGGER
 
 from .blob import BlobFile
+from .cuvs import is_cuvs_accelerator
 from .dependencies import (
     _check_for_numpy,
     _check_for_torch,
@@ -2899,20 +2900,24 @@ class LanceDataset(pa.dataset.Dataset):
 
         # Handle timing for various parts of accelerated builds
         timers = {}
+        use_cuvs = is_cuvs_accelerator(accelerator)
         if accelerator is not None and index_type != "IVF_PQ":
+            if use_cuvs:
+                raise ValueError(
+                    f"accelerator='{accelerator}' only supports IVF_PQ index builds"
+                )
             LOGGER.warning(
                 "Index type %s does not support GPU acceleration; falling back to CPU",
                 index_type,
             )
             accelerator = None
+            use_cuvs = False
 
         # IMPORTANT: Distributed indexing is CPU-only. Enforce single-node when
-        # accelerator or torch-related paths are detected.
-        torch_detected = False
+        # any Python-side accelerator path is selected.
+        accelerated_build_detected = accelerator is not None
         try:
-            if accelerator is not None:
-                torch_detected = True
-            else:
+            if accelerator is None:
                 impl = kwargs.get("implementation")
                 use_torch_flag = kwargs.get("use_torch") is True
                 one_pass_flag = kwargs.get("one_pass_ivfpq") is True
@@ -2925,16 +2930,16 @@ class LanceDataset(pa.dataset.Dataset):
                     or torch_centroids
                     or torch_codebook
                 ):
-                    torch_detected = True
+                    accelerated_build_detected = True
         except Exception:
             # Be conservative: if detection fails, do not modify behavior
             pass
 
-        if torch_detected:
+        if accelerated_build_detected:
             if require_commit:
                 if fragment_ids is not None or index_uuid is not None:
                     LOGGER.info(
-                        "Torch detected; "
+                        "Accelerated build detected; "
                         "enforce single-node indexing (distributed is CPU-only)."
                     )
                 fragment_ids = None
@@ -2942,63 +2947,92 @@ class LanceDataset(pa.dataset.Dataset):
             else:
                 if index_uuid is not None:
                     LOGGER.info(
-                        "Torch detected; "
+                        "Accelerated build detected; "
                         "enforce single-node indexing (distributed is CPU-only)."
                     )
                 index_uuid = None
 
         if accelerator is not None:
-            from .vector import (
-                one_pass_assign_ivf_pq_on_accelerator,
-                one_pass_train_ivf_pq_on_accelerator,
-            )
-
-            LOGGER.info("Doing one-pass ivfpq accelerated computations")
             if num_partitions is None:
                 num_rows = self.count_rows()
                 num_partitions = _target_partition_size_to_num_partitions(
                     num_rows, target_partition_size
                 )
-            timers["ivf+pq_train:start"] = time.time()
-            (
-                ivf_centroids,
-                ivf_kmeans,
-                pq_codebook,
-                pq_kmeans_list,
-            ) = one_pass_train_ivf_pq_on_accelerator(
-                self,
-                column[0],
-                num_partitions,
-                metric,
-                accelerator,
-                num_sub_vectors=num_sub_vectors,
-                batch_size=20480,
-                filter_nan=filter_nan,
-            )
-            timers["ivf+pq_train:end"] = time.time()
-            ivfpq_train_time = timers["ivf+pq_train:end"] - timers["ivf+pq_train:start"]
-            LOGGER.info("ivf+pq training time: %ss", ivfpq_train_time)
-            timers["ivf+pq_assign:start"] = time.time()
-            shuffle_output_dir, shuffle_buffers = one_pass_assign_ivf_pq_on_accelerator(
-                self,
-                column[0],
-                metric,
-                accelerator,
-                ivf_kmeans,
-                pq_kmeans_list,
-                batch_size=20480,
-                filter_nan=filter_nan,
-            )
-            timers["ivf+pq_assign:end"] = time.time()
-            ivfpq_assign_time = (
-                timers["ivf+pq_assign:end"] - timers["ivf+pq_assign:start"]
-            )
-            LOGGER.info("ivf+pq transform time: %ss", ivfpq_assign_time)
 
-            kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
-            kwargs["precomputed_shuffle_buffers_path"] = os.path.join(
-                shuffle_output_dir, "data"
-            )
+            if use_cuvs:
+                from .cuvs import one_pass_train_ivf_pq_on_cuvs
+
+                LOGGER.info("Doing one-pass ivfpq cuVS training")
+                timers["ivf+pq_train:start"] = time.time()
+                ivf_centroids, pq_codebook = one_pass_train_ivf_pq_on_cuvs(
+                    self,
+                    column[0],
+                    num_partitions,
+                    metric,
+                    accelerator,
+                    num_sub_vectors=num_sub_vectors,
+                    sample_rate=kwargs.get("sample_rate", 256),
+                    max_iters=kwargs.get("max_iters", 50),
+                    num_bits=kwargs.get("num_bits", 8),
+                    filter_nan=filter_nan,
+                )
+                timers["ivf+pq_train:end"] = time.time()
+                ivfpq_train_time = (
+                    timers["ivf+pq_train:end"] - timers["ivf+pq_train:start"]
+                )
+                LOGGER.info("cuVS ivf+pq training time: %ss", ivfpq_train_time)
+            else:
+                from .vector import (
+                    one_pass_assign_ivf_pq_on_accelerator,
+                    one_pass_train_ivf_pq_on_accelerator,
+                )
+
+                LOGGER.info("Doing one-pass ivfpq accelerated computations")
+                timers["ivf+pq_train:start"] = time.time()
+                (
+                    ivf_centroids,
+                    ivf_kmeans,
+                    pq_codebook,
+                    pq_kmeans_list,
+                ) = one_pass_train_ivf_pq_on_accelerator(
+                    self,
+                    column[0],
+                    num_partitions,
+                    metric,
+                    accelerator,
+                    num_sub_vectors=num_sub_vectors,
+                    batch_size=20480,
+                    filter_nan=filter_nan,
+                )
+                timers["ivf+pq_train:end"] = time.time()
+                ivfpq_train_time = (
+                    timers["ivf+pq_train:end"] - timers["ivf+pq_train:start"]
+                )
+                LOGGER.info("ivf+pq training time: %ss", ivfpq_train_time)
+                timers["ivf+pq_assign:start"] = time.time()
+                (
+                    shuffle_output_dir,
+                    shuffle_buffers,
+                ) = one_pass_assign_ivf_pq_on_accelerator(
+                    self,
+                    column[0],
+                    metric,
+                    accelerator,
+                    ivf_kmeans,
+                    pq_kmeans_list,
+                    batch_size=20480,
+                    filter_nan=filter_nan,
+                )
+                timers["ivf+pq_assign:end"] = time.time()
+                ivfpq_assign_time = (
+                    timers["ivf+pq_assign:end"] - timers["ivf+pq_assign:start"]
+                )
+                LOGGER.info("ivf+pq transform time: %ss", ivfpq_assign_time)
+
+                kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
+                kwargs["precomputed_shuffle_buffers_path"] = os.path.join(
+                    shuffle_output_dir, "data"
+                )
         if index_type.startswith("IVF"):
             if (ivf_centroids is not None) and (ivf_centroids_file is not None):
                 raise ValueError(

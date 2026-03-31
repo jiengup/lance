@@ -9,10 +9,12 @@ import shutil
 import string
 import tempfile
 import time
+from importlib import import_module
 from pathlib import Path
 from typing import Optional
 
 import lance
+import lance.cuvs as lance_cuvs
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -505,6 +507,15 @@ def test_create_index_unsupported_accelerator(tmp_path):
             accelerator="cuda:abc",
         )
 
+    with pytest.raises(ValueError):
+        dataset.create_index(
+            "vector",
+            index_type="IVF_PQ",
+            num_partitions=4,
+            num_sub_vectors=16,
+            accelerator="cuvs:0",
+        )
+
 
 def test_create_index_accelerator_fallback(tmp_path, caplog):
     tbl = create_table()
@@ -524,6 +535,124 @@ def test_create_index_accelerator_fallback(tmp_path, caplog):
         "does not support GPU acceleration; falling back to CPU" in record.message
         for record in caplog.records
     )
+
+
+def test_create_index_cuvs_dispatch(tmp_path, monkeypatch):
+    tbl = create_table(nvec=512, ndim=128)
+    dataset = lance.write_dataset(tbl, tmp_path)
+    calls = {}
+
+    def fake_train(
+        dataset_arg,
+        column,
+        num_partitions,
+        metric_type,
+        accelerator,
+        num_sub_vectors,
+        *,
+        sample_rate,
+        max_iters,
+        num_bits,
+        filter_nan,
+    ):
+        calls["dataset"] = dataset_arg
+        calls["column"] = column
+        calls["num_partitions"] = num_partitions
+        calls["metric_type"] = metric_type
+        calls["accelerator"] = accelerator
+        calls["num_sub_vectors"] = num_sub_vectors
+        calls["sample_rate"] = sample_rate
+        calls["max_iters"] = max_iters
+        calls["num_bits"] = num_bits
+        calls["filter_nan"] = filter_nan
+        return (
+            np.random.randn(num_partitions, 128).astype(np.float32),
+            np.random.randn(num_sub_vectors, 256, 128 // num_sub_vectors).astype(
+                np.float32
+            ),
+        )
+
+    monkeypatch.setattr(lance_cuvs, "one_pass_train_ivf_pq_on_cuvs", fake_train)
+
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        accelerator="cuvs",
+    )
+
+    assert calls["column"] == "vector"
+    assert calls["num_partitions"] == 4
+    assert calls["metric_type"] == "L2"
+    assert calls["accelerator"] == "cuvs"
+    assert calls["num_sub_vectors"] == 16
+    assert dataset.stats.index_stats("vector_idx")["index_type"] == "IVF_PQ"
+
+
+def test_create_index_cuvs_rejects_non_ivf_pq(tmp_path):
+    tbl = create_table()
+    dataset = lance.write_dataset(tbl, tmp_path)
+
+    with pytest.raises(ValueError, match="only supports IVF_PQ"):
+        dataset.create_index(
+            "vector",
+            index_type="IVF_FLAT",
+            num_partitions=4,
+            accelerator="cuvs",
+        )
+
+
+def test_prepare_global_ivf_pq_cuvs_dispatch(tmp_path, monkeypatch):
+    ds = _make_sample_dataset_base(tmp_path, "cuvs_prepare_ds", 512, 128)
+    builder = IndicesBuilder(ds, "vector")
+    builder_module = import_module("lance.indices.builder")
+    calls = {}
+
+    def fake_prepare(
+        dataset_arg,
+        column,
+        num_partitions,
+        num_sub_vectors,
+        *,
+        distance_type,
+        accelerator,
+        sample_rate,
+        max_iters,
+    ):
+        calls["dataset"] = dataset_arg
+        calls["column"] = column
+        calls["num_partitions"] = num_partitions
+        calls["num_sub_vectors"] = num_sub_vectors
+        calls["distance_type"] = distance_type
+        calls["accelerator"] = accelerator
+        calls["sample_rate"] = sample_rate
+        calls["max_iters"] = max_iters
+        return {
+            "ivf_centroids": np.random.randn(num_partitions, 128).astype(np.float32),
+            "pq_codebook": np.random.randn(
+                num_sub_vectors, 256, 128 // num_sub_vectors
+            ).astype(np.float32),
+        }
+
+    monkeypatch.setattr(builder_module, "prepare_global_ivf_pq_on_cuvs", fake_prepare)
+
+    prepared = builder.prepare_global_ivf_pq(
+        num_partitions=4,
+        num_subvectors=16,
+        distance_type="l2",
+        accelerator="cuvs",
+        sample_rate=7,
+        max_iters=20,
+    )
+
+    assert calls["column"] == "vector"
+    assert calls["num_partitions"] == 4
+    assert calls["num_sub_vectors"] == 16
+    assert calls["distance_type"] == "l2"
+    assert calls["accelerator"] == "cuvs"
+    assert prepared["ivf_centroids"].shape == (4, 128)
+    assert prepared["pq_codebook"].shape == (16, 256, 8)
 
 
 def test_use_index(dataset, tmp_path):
