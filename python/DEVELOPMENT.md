@@ -8,6 +8,22 @@ uv sync --extra tests --extra dev
 
 Add extras such as `benchmarks`, `torch`, or `geo` only when you need them. After the environment is initialized, either activate it or use `uv run ...` for commands.
 
+`accelerator="cuvs"` does not have a normal project extra today. cuVS Python
+packages are published per CUDA major version and are typically installed from
+NVIDIA's package index, for example:
+
+```shell
+uv pip install --extra-index-url https://pypi.nvidia.com cuvs-cu12
+```
+
+or:
+
+```shell
+uv pip install --extra-index-url https://pypi.nvidia.com cuvs-cu13
+```
+
+Pick the package that matches the CUDA version in your environment.
+
 `uv sync` is not just downloading Python packages here. It also builds the local `pylance` Rust extension as part of the editable environment, so the first run, cache misses, or Rust dependency changes can make it noticeably slow. This is expected; let the build finish instead of interrupting it and switching to a different environment setup.
 
 ## Building the project

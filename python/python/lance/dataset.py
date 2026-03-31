@@ -3263,7 +3263,12 @@ class LanceDataset(pa.dataset.Dataset):
             The number of sub-vectors for PQ (Product Quantization).
         accelerator : str or ``torch.Device``, optional
             If set, use an accelerator to speed up the training process.
-            Accepted accelerator: "cuda" (Nvidia GPU) and "mps" (Apple Silicon GPU).
+            Accepted accelerator:
+
+            - "cuda" or ``torch.device(...)`` for the existing torch-based path
+            - "mps" for Apple Silicon GPU
+            - "cuvs" for the explicit cuVS-based IVF_PQ training path
+
             If not set, use the CPU.
         index_cache_size : int, optional
             The size of the index cache in number of entries. Default value is 256.
@@ -3372,8 +3377,10 @@ class LanceDataset(pa.dataset.Dataset):
         Experimental Accelerator (GPU) support:
 
         - *accelerate*: use GPU to train IVF partitions.
-            Only supports CUDA (Nvidia) or MPS (Apple) currently.
-            Requires PyTorch being installed.
+            `accelerator="cuda"` and `accelerator="mps"` use the existing torch path.
+            `accelerator="cuvs"` uses cuVS for IVF_PQ training only.
+            The torch path requires PyTorch. The cuVS path requires the cuVS Python
+            bindings to be installed separately.
 
         .. code-block:: python
 
@@ -3388,9 +3395,10 @@ class LanceDataset(pa.dataset.Dataset):
                 accelerator="cuda"
             )
 
-        Note: GPU acceleration is currently supported only for the ``IVF_PQ`` index
-        type. Providing an accelerator for other index types will fall back to CPU
-        index building.
+        Note: accelerator support is currently limited to the ``IVF_PQ`` index type.
+        Providing ``accelerator="cuda"`` for other index types will fall back to CPU
+        index building. Providing ``accelerator="cuvs"`` for other index types will
+        raise an error.
 
         References
         ----------

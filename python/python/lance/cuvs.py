@@ -20,7 +20,9 @@ def _require_cuvs():
         return import_module("cuvs.neighbors.ivf_pq")
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
-            "accelerator='cuvs' requires the 'cuvs' package to be installed"
+            "accelerator='cuvs' requires cuVS Python bindings to be installed. "
+            "Install a CUDA-matched package such as 'cuvs-cu12' or 'cuvs-cu13' "
+            "from https://pypi.nvidia.com."
         ) from exc
 
 
