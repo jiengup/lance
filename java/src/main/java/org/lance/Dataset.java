@@ -790,8 +790,13 @@ public class Dataset implements Closeable {
    * @return the version id of the dataset
    */
   public long version() {
-    return getVersion().getId();
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetVersionId();
+    }
   }
+
+  private native long nativeGetVersionId();
 
   /**
    * Gets the currently checked out version of the dataset.
@@ -1019,25 +1024,17 @@ public class Dataset implements Closeable {
   private native void innerMergeIndexMetadata(
       String indexUUID, int indexType, Optional<Integer> batchReadHead);
 
-  /**
-   * Build physical vector index segments from previously-created fragment-level index outputs.
-   *
-   * @param segments segment metadata returned by {@link #createIndex(IndexOptions)} when
-   *     fragmentIds are provided
-   * @param targetSegmentBytes optional size target for merged physical segments
-   * @return built physical segment metadata
-   */
-  public List<Index> buildIndexSegments(List<Index> segments, Optional<Long> targetSegmentBytes) {
+  /** Merge one caller-defined group of existing uncommitted vector index segments. */
+  public Index mergeExistingIndexSegments(List<Index> segments) {
     Preconditions.checkNotNull(segments, "segments cannot be null");
     Preconditions.checkArgument(!segments.isEmpty(), "segments cannot be empty");
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeBuildIndexSegments(segments, targetSegmentBytes);
+      return nativeMergeExistingIndexSegments(segments);
     }
   }
 
-  private native List<Index> nativeBuildIndexSegments(
-      List<Index> segments, Optional<Long> targetSegmentBytes);
+  private native Index nativeMergeExistingIndexSegments(List<Index> segments);
 
   /**
    * Publish one or more existing physical index segments as a logical index.
@@ -1252,7 +1249,11 @@ public class Dataset implements Closeable {
   /**
    * Get all indexes with full metadata.
    *
-   * @return list of Index objects with complete metadata including index type and fragment coverage
+   * <p>Each returned {@link Index} is a physical index segment from the manifest. Use {@link
+   * #describeIndices()} for the logical-index view.
+   *
+   * @return list of Index objects with complete segment metadata, including index type and fragment
+   *     coverage
    */
   public List<Index> getIndexes() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
@@ -1324,6 +1325,23 @@ public class Dataset implements Closeable {
   }
 
   private native Map<String, String> nativeGetConfig();
+
+  /**
+   * Check whether the dataset uses stable row IDs.
+   *
+   * <p>Stable row IDs remain constant when rows are moved during compaction. This reads the
+   * manifest feature flag directly rather than the user-facing config map.
+   *
+   * @return true if the dataset was created with stable row IDs enabled
+   */
+  public boolean hasStableRowIds() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeHasStableRowIds();
+    }
+  }
+
+  private native boolean nativeHasStableRowIds();
 
   /**
    * Get the Lance file format version of this dataset.
