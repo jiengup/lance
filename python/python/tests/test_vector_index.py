@@ -743,7 +743,7 @@ def test_train_ivf_pq_on_cuvs_nullable_vectors(tmp_path, monkeypatch):
     assert pq_codebook.shape == (4, 256, 4)
 
 
-def test_train_ivf_pq_on_cuvs_uses_subvector_dimension_for_pq_dim(
+def test_train_ivf_pq_on_cuvs_uses_num_sub_vectors_for_pq_dim(
     tmp_path, monkeypatch
 ):
     dataset = lance.write_dataset(create_table(nvec=32, ndim=16), tmp_path)
@@ -775,9 +775,20 @@ def test_train_ivf_pq_on_cuvs_uses_subvector_dimension_for_pq_dim(
         sample_rate=4,
     )
 
-    assert calls["pq_dim"] == 8
+    assert calls["pq_dim"] == 2
     assert centroids.shape == (4, 16)
     assert pq_codebook.shape == (2, 256, 8)
+
+
+def test_normalize_pq_codebook_accepts_subvector_dim_first_layout():
+    class FakeIndex:
+        pq_centers = np.random.randn(8, 16, 256).astype(np.float32)
+
+    pq_codebook = lance_cuvs._normalize_pq_codebook(
+        FakeIndex(), num_sub_vectors=16, num_bits=8, dimension=128
+    )
+
+    assert pq_codebook.shape == (16, 256, 8)
 
 
 def test_cuvs_as_numpy_prefers_copy_to_host():
@@ -853,6 +864,37 @@ def test_one_pass_assign_ivf_pq_on_cuvs_writes_shuffle_buffers(tmp_path, monkeyp
     assert data_batch.column("_rowid").type == pa.uint64()
     assert data_batch.column("__pq_code").type == pa.list_(pa.uint8(), 4)
     assert offsets_batch.column("offset").type == pa.uint64()
+
+
+def test_one_pass_assign_ivf_pq_on_cuvs_rejects_incompatible_transform_width(
+    tmp_path,
+    monkeypatch,
+):
+    tbl = create_table(nvec=32, ndim=128)
+    dataset = lance.write_dataset(tbl, tmp_path / "cuvs_assign_incompatible")
+
+    ivf_centroids = np.random.randn(4, 128).astype(np.float32)
+    pq_codebook = np.random.randn(16, 256, 8).astype(np.float32)
+    monkeypatch.setattr(lance_cuvs, "_require_cuvs", lambda: object())
+
+    class FakeIndex:
+        pq_dim = 8
+        pq_bits = 8
+
+    with pytest.raises(
+        ValueError,
+        match="cuVS transform output is incompatible with Lance IVF_PQ",
+    ):
+        lance_cuvs.one_pass_assign_ivf_pq_on_cuvs(
+            dataset,
+            "vector",
+            "l2",
+            "cuvs",
+            ivf_centroids,
+            pq_codebook,
+            trained_index=FakeIndex(),
+            batch_size=8,
+        )
 
 
 def test_use_index(dataset, tmp_path):

@@ -155,6 +155,7 @@ def _normalize_pq_codebook(
     pq_centers = _as_numpy(index.pq_centers)
 
     expected_shapes = {
+        (subvector_dim, num_sub_vectors, pq_book_size): (1, 2, 0),
         (num_sub_vectors, subvector_dim, pq_book_size): (0, 2, 1),
         (num_sub_vectors, pq_book_size, subvector_dim): None,
     }
@@ -349,7 +350,7 @@ def _train_ivf_pq_index_on_cuvs(
             matrix.shape[0], num_partitions, sample_rate
         ),
         pq_bits=num_bits,
-        pq_dim=dimension // num_sub_vectors,
+        pq_dim=num_sub_vectors,
         codebook_kind="subspace",
         force_random_rotation=False,
         add_data_on_build=False,
@@ -390,6 +391,15 @@ def one_pass_assign_ivf_pq_on_cuvs(
         raise ValueError(
             "one_pass_assign_ivf_pq_on_cuvs requires a trained cuVS index for "
             "single-node transform"
+        )
+    transform_code_width = (trained_index.pq_dim * trained_index.pq_bits + 7) // 8
+    if transform_code_width != num_sub_vectors:
+        raise ValueError(
+            "cuVS transform output is incompatible with Lance IVF_PQ for this "
+            "configuration: expected "
+            f"{num_sub_vectors} PQ code columns, but cuVS will produce "
+            f"{transform_code_width}. Use a configuration where "
+            "ceil(pq_dim * pq_bits / 8) == num_sub_vectors."
         )
 
     progress = _make_progress(num_rows)
