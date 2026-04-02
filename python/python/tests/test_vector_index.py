@@ -853,17 +853,14 @@ def test_one_pass_assign_ivf_pq_on_cuvs_writes_shuffle_buffers(tmp_path, monkeyp
         batch_size=8,
     )
 
-    from lance.file import LanceFileReader
+    shuffle_ds = lance.dataset(shuffle_uri)
+    data_batch = next(shuffle_ds.to_batches(batch_size=1024))
 
-    data_reader = LanceFileReader(str(Path(shuffle_uri) / "shuffle_data.lance"))
-    offsets_reader = LanceFileReader(str(Path(shuffle_uri) / "shuffle_offsets.lance"))
-    data_batch = next(data_reader.read_all(batch_size=1024).to_batches())
-    offsets_batch = next(offsets_reader.read_all(batch_size=1024).to_batches())
-
-    assert shuffle_buffers == ["shuffle_data.lance", "shuffle_offsets.lance"]
-    assert data_batch.column("_rowid").type == pa.uint64()
+    assert len(shuffle_buffers) > 0
+    assert all(path.endswith(".lance") for path in shuffle_buffers)
+    assert data_batch.column("row_id").type == pa.uint64()
+    assert data_batch.column("__ivf_part_id").type == pa.uint32()
     assert data_batch.column("__pq_code").type == pa.list_(pa.uint8(), 4)
-    assert offsets_batch.column("offset").type == pa.uint64()
 
 
 def test_one_pass_assign_ivf_pq_on_cuvs_rejects_incompatible_transform_width(
