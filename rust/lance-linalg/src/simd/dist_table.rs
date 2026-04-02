@@ -72,24 +72,7 @@ pub fn accumulate_4bit_packed_block(block: &[u8], dist_table: &[u8], dists: &mut
     debug_assert_eq!(dist_table.len(), BATCH_SIZE);
     debug_assert_eq!(dists.len(), BATCH_SIZE);
 
-    match *SIMD_SUPPORT {
-        #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
-        SimdSupport::Avx512 | SimdSupport::Avx512FP16 => unsafe {
-            let mut tmp = [0u16; BATCH_SIZE];
-            sum_4bit_dist_table_32bytes_batch_avx512(
-                block.as_ptr(),
-                block.len(),
-                dist_table.as_ptr(),
-                tmp.as_mut_ptr(),
-            );
-            for (dist, delta) in dists.iter_mut().zip(tmp) {
-                *dist = dist.saturating_add(delta);
-            }
-        },
-        #[cfg(target_arch = "x86_64")]
-        SimdSupport::Avx2 => accumulate_4bit_packed_block_scalar(block, dist_table, dists),
-        _ => accumulate_4bit_packed_block_scalar(block, dist_table, dists),
-    }
+    accumulate_4bit_packed_block_scalar(block, dist_table, dists)
 }
 
 #[inline]
