@@ -307,4 +307,32 @@ mod tests {
         // so the distance is 2 * (dist_table[0x6] + dist_table[0xb + 16]) = 2*(7 + 12) = 38
         assert_eq!(dists[1], 38);
     }
+
+    #[test]
+    fn test_accumulate_4bit_packed_block_matches_scalar_randomized() {
+        fn next_u32(state: &mut u64) -> u32 {
+            *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (*state >> 32) as u32
+        }
+
+        for seed in 0..256u64 {
+            let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+            let mut block = [0u8; BATCH_SIZE];
+            let mut dist_table = [0u8; BATCH_SIZE];
+            for value in block.iter_mut() {
+                *value = next_u32(&mut state) as u8;
+            }
+            for value in dist_table.iter_mut() {
+                *value = next_u32(&mut state) as u8;
+            }
+
+            let mut actual = [0u16; BATCH_SIZE];
+            accumulate_4bit_packed_block(&block, &dist_table, &mut actual);
+
+            let mut expected = [0u16; BATCH_SIZE];
+            accumulate_4bit_packed_block_scalar(&block, &dist_table, &mut expected);
+
+            assert_eq!(actual, expected, "seed={seed}");
+        }
+    }
 }
