@@ -807,6 +807,35 @@ def test_cuvs_as_numpy_prefers_copy_to_host():
     assert array.dtype == np.float32
 
 
+def test_annotate_precomputed_encoded_dataset_scans_fragment_directly(tmp_path):
+    dataset_uri = tmp_path / "encoded_dataset"
+
+    def make_table(partition_ids: list[int], row_id_start: int):
+        part_ids = np.asarray(partition_ids, dtype=np.uint32)
+        row_ids = pa.array(
+            np.arange(row_id_start, row_id_start + len(partition_ids), dtype=np.uint64)
+        )
+        pq_values = pa.array(np.zeros(len(partition_ids) * 4, dtype=np.uint8))
+        pq_codes = pa.FixedSizeListArray.from_arrays(pq_values, 4)
+        return pa.Table.from_arrays(
+            [row_ids, pa.array(part_ids), pq_codes],
+            names=["row_id", "__ivf_part_id", "__pq_code"],
+        )
+
+    ds = lance.write_dataset(make_table([0, 1, 1, 0], 0), dataset_uri)
+    ds = lance.write_dataset(make_table([2, 3, 2, 3], 4), dataset_uri, mode="append")
+
+    lance_cuvs._annotate_precomputed_encoded_dataset(ds, [2, 2, 2, 2])
+
+    metadata = ds.metadata()
+    partition_fragments = json.loads(
+        metadata[
+            lance_cuvs.PRECOMPUTED_ENCODED_PARTITION_FRAGMENT_IDS_METADATA_KEY
+        ]
+    )
+    assert partition_fragments == [[0], [0], [1], [1]]
+
+
 def test_one_pass_assign_ivf_pq_on_cuvs_writes_encoded_dataset(tmp_path, monkeypatch):
     tbl = create_table(nvec=32, ndim=16)
     dataset = lance.write_dataset(tbl, tmp_path / "cuvs_assign_src")

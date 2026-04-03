@@ -120,11 +120,7 @@ def _annotate_precomputed_encoded_dataset(
     partition_fragments = [[] for _ in range(len(partition_sizes))]
     for fragment in dataset.get_fragments():
         fragment_partitions = set()
-        scanner = (
-            dataset.scanner(columns=["__ivf_part_id"])
-            .with_fragments([fragment])
-            .to_scanner()
-        )
+        scanner = fragment.scanner(columns=["__ivf_part_id"])
         for batch in scanner.to_batches():
             fragment_partitions.update(
                 int(partition_id)
