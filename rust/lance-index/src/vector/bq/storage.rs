@@ -377,21 +377,21 @@ impl<'a> RabitDistCalculator<'a> {
                     }
 
                     let remaining_quantized = suffix_max_quantized[chunk_end];
-                    let batch_lower_bound = quantized_sums
-                        .iter()
-                        .enumerate()
-                        .map(|(lane, partial_sum)| {
-                            let saturated_upper_sum = (u32::from(*partial_sum)
-                                + remaining_quantized)
-                                .min(u16::MAX as u32)
-                                as f32;
-                            let id = batch_offset + lane;
-                            let dist_upper_bound = saturated_upper_sum * range + sum_min;
-                            self.finalize_distance(id, dist_upper_bound)
-                        })
-                        .fold(f32::INFINITY, f32::min);
+                    let prune_threshold = results.peek().unwrap().dist.0;
+                    let mut can_prune_batch = true;
+                    for (lane, partial_sum) in quantized_sums.iter().enumerate() {
+                        let saturated_upper_sum = (u32::from(*partial_sum) + remaining_quantized)
+                            .min(u16::MAX as u32)
+                            as f32;
+                        let id = batch_offset + lane;
+                        let dist_upper_bound = saturated_upper_sum * range + sum_min;
+                        if self.finalize_distance(id, dist_upper_bound) <= prune_threshold {
+                            can_prune_batch = false;
+                            break;
+                        }
+                    }
 
-                    if batch_lower_bound > results.peek().unwrap().dist.0 {
+                    if can_prune_batch {
                         stats.pruned_batches += 1;
                         stats.pruned_rows += BATCH_SIZE;
                         should_skip_batch = true;
@@ -468,8 +468,9 @@ fn push_topk_result<T: PartialEq + Eq>(
     if results.len() < k {
         results.push(candidate);
     } else if candidate.dist < results.peek().unwrap().dist {
-        results.pop();
-        results.push(candidate);
+        let mut worst = results.peek_mut().unwrap();
+        *worst = candidate;
+        drop(worst);
     }
 }
 
@@ -527,12 +528,20 @@ where
 // Quantize the distance table to u8, map distance `d` to `(d-qmin) * 255 / (qmax-qmin)`
 #[inline]
 fn quantize_dist_table(dist_table: &[f32]) -> (f32, f32, Vec<u8>) {
-    let (qmin, qmax) = dist_table
-        .iter()
-        .cloned()
-        .minmax_by(|a, b| a.total_cmp(b))
-        .into_option()
-        .unwrap();
+    let mut values = dist_table.iter().copied();
+    let Some(first) = values.next() else {
+        return (0.0, 0.0, Vec::new());
+    };
+    let mut qmin = first;
+    let mut qmax = first;
+    for value in values {
+        if value < qmin {
+            qmin = value;
+        }
+        if value > qmax {
+            qmax = value;
+        }
+    }
     // this happens if the query is all zeros
     if qmin == qmax {
         return (qmin, qmax, vec![0; dist_table.len()]);
