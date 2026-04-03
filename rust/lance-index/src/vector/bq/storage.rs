@@ -328,12 +328,18 @@ impl<'a> RabitDistCalculator<'a> {
         let packed_num_vectors = num_vectors - remainder;
         let mut results: BinaryHeap<OrderedNode<u64>> =
             BinaryHeap::with_capacity(k.min(num_vectors));
+        let mut warmup_batches_remaining = if code_len >= PRUNE_WARMUP_MIN_CODE_LEN {
+            PRUNE_WARMUP_BATCHES
+        } else {
+            0
+        };
 
         for batch_offset in (0..packed_num_vectors).step_by(BATCH_SIZE) {
             let packed_batch =
                 &self.codes[batch_offset * code_len..(batch_offset + BATCH_SIZE) * code_len];
             let mut quantized_sums = [0u16; BATCH_SIZE];
-            if results.len() < k {
+            let heap_needs_fill = results.len() < k;
+            if heap_needs_fill || warmup_batches_remaining > 0 {
                 simd::dist_table::sum_4bit_dist_table(
                     BATCH_SIZE,
                     code_len,
@@ -341,12 +347,17 @@ impl<'a> RabitDistCalculator<'a> {
                     &quantized_dists_table,
                     &mut quantized_sums,
                 );
+                if !heap_needs_fill {
+                    warmup_batches_remaining = warmup_batches_remaining.saturating_sub(1);
+                }
             } else {
                 let mut chunk_deltas = [0u16; BATCH_SIZE];
                 let mut should_skip_batch = false;
+                let mut chunk_start = 0usize;
+                let mut check_span = PRUNE_INITIAL_CHUNK_BYTES;
 
-                for chunk_start in (0..code_len).step_by(PRUNE_CHUNK_BYTES) {
-                    let chunk_end = (chunk_start + PRUNE_CHUNK_BYTES).min(code_len);
+                while chunk_start < code_len {
+                    let chunk_end = (chunk_start + check_span).min(code_len);
                     let chunk_len = chunk_end - chunk_start;
                     let code_offset = chunk_start * BATCH_SIZE;
                     let code_end = chunk_end * BATCH_SIZE;
@@ -386,6 +397,9 @@ impl<'a> RabitDistCalculator<'a> {
                         should_skip_batch = true;
                         break;
                     }
+
+                    chunk_start = chunk_end;
+                    check_span = (check_span * 2).min(code_len);
                 }
 
                 if should_skip_batch {
@@ -761,7 +775,9 @@ const LOWBIT_IDX: [usize; 16] = {
     array
 };
 
-const PRUNE_CHUNK_BYTES: usize = 64;
+const PRUNE_INITIAL_CHUNK_BYTES: usize = 64;
+const PRUNE_WARMUP_BATCHES: usize = 2;
+const PRUNE_WARMUP_MIN_CODE_LEN: usize = PRUNE_INITIAL_CHUNK_BYTES * 2;
 
 fn get_column(
     quantization_code: &[u8],
