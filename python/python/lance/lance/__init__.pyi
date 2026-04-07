@@ -135,6 +135,20 @@ class LanceFileSession:
     def upload_file(self, local_path: str, remote_path: str) -> None: ...
     def download_file(self, remote_path: str, local_path: str) -> None: ...
 
+class PartitionArtifactBuilder:
+    def __init__(
+        self,
+        uri_or_path: str,
+        num_partitions: int,
+        pq_code_width: int,
+        storage_options: Optional[Dict[str, str]] = None,
+        storage_options_provider: Optional[StorageOptionsProvider] = None,
+    ): ...
+    def append_batch(self, batch: pa.RecordBatch) -> None: ...
+    def finish(
+        self, metadata_file: str, total_loss: Optional[float] = None
+    ) -> List[str]: ...
+
 class LanceFileReader:
     def __init__(
         self,

@@ -94,6 +94,7 @@ use super::v2::IVFIndex;
 use super::{
     encoded_dataset::EncodedDatasetShuffleReader,
     ivf::load_precomputed_partitions_if_available,
+    partition_artifact::PartitionArtifactShuffleReader,
     utils::{self, get_vector_type},
 };
 
@@ -237,6 +238,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             .and_then(|params| params.storage_options.as_ref());
         Ok(Arc::new(
             EncodedDatasetShuffleReader::try_open(uri, storage_options).await?,
+        ))
+    }
+
+    async fn try_open_precomputed_partition_artifact_reader(
+        &self,
+        uri: &str,
+    ) -> Result<Arc<dyn ShuffleReader>> {
+        let storage_options = self
+            .ivf_params
+            .as_ref()
+            .and_then(|params| params.storage_options.as_ref());
+        Ok(Arc::new(
+            PartitionArtifactShuffleReader::try_open(uri, storage_options).await?,
         ))
     }
 
@@ -621,6 +635,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let Some(dataset) = self.dataset.as_ref() else {
             return Err(Error::invalid_input("dataset not set before shuffling"));
         };
+
+        if let Some(uri) = self
+            .ivf_params
+            .as_ref()
+            .and_then(|params| params.precomputed_partition_artifact_uri.as_deref())
+        {
+            log::info!("shuffle with precomputed partition artifact from {}", uri);
+            self.shuffle_reader = Some(
+                self.try_open_precomputed_partition_artifact_reader(uri)
+                    .await?,
+            );
+            return Ok(());
+        }
 
         if let Some(uri) = self
             .ivf_params

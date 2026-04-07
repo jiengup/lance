@@ -51,7 +51,8 @@ use dataset::{
 use env_logger::{Builder, Env};
 use file::{
     LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
-    LanceFileStatistics, LanceFileWriter, LancePageMetadata, stable_version,
+    LanceFileStatistics, LanceFileWriter, LancePageMetadata, PartitionArtifactBuilder,
+    stable_version,
 };
 use log::Level;
 use pyo3::exceptions::PyIOError;
@@ -258,6 +259,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LanceBlobFile>()?;
     m.add_class::<LanceFileReader>()?;
     m.add_class::<LanceFileWriter>()?;
+    m.add_class::<PartitionArtifactBuilder>()?;
     m.add_class::<LanceFileSession>()?;
     m.add_class::<LanceFileMetadata>()?;
     m.add_class::<LanceFileStatistics>()?;

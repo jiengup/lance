@@ -10,6 +10,7 @@ use std::{any::Any, collections::HashMap};
 pub mod builder;
 mod encoded_dataset;
 pub mod ivf;
+mod partition_artifact;
 pub mod pq;
 pub mod utils;
 
@@ -32,6 +33,7 @@ use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::builder::recommended_num_partitions;
 use lance_index::vector::ivf::storage::IvfModel;
 use object_store::path::Path;
+pub use partition_artifact::PartitionArtifactBuilder;
 
 use lance_arrow::FixedSizeListArrayExt;
 use lance_index::vector::pq::ProductQuantizer;
@@ -1657,6 +1659,7 @@ fn derive_ivf_params(ivf_model: &IvfModel) -> IvfBuildParams {
         precomputed_partitions_file: None,
         precomputed_shuffle_buffers: None,
         precomputed_encoded_dataset_uri: None,
+        precomputed_partition_artifact_uri: None,
         shuffle_partition_batches: 1024 * 10, // Default
         shuffle_partition_concurrency: 2,     // Default
         storage_options: None,

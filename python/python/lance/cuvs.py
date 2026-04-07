@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Iterator, Tuple
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from .file import LanceFileSession
+from .lance import PartitionArtifactBuilder
 from .dependencies import numpy as np
 from .log import LOGGER
 from .util import _normalize_metric_type
@@ -28,6 +30,36 @@ PRECOMPUTED_ENCODED_PARTITION_FRAGMENT_IDS_METADATA_KEY = (
 PRECOMPUTED_ENCODED_TOTAL_LOSS_METADATA_KEY = (
     "lance:index_build:precomputed_encoded_total_loss"
 )
+
+PARTITION_ARTIFACT_MANIFEST_VERSION = 1
+PARTITION_ARTIFACT_MANIFEST_FILE_NAME = "manifest.json"
+PARTITION_ARTIFACT_METADATA_FILE_NAME = "metadata.lance"
+PARTITION_ARTIFACT_PARTITIONS_DIR = "partitions"
+DEFAULT_PARTITION_ARTIFACT_BUCKETS = 256
+PARTITION_ARTIFACT_ROW_ID_COLUMN = "_rowid"
+
+try:
+    from . import lance as _lance_ext
+
+    _assign_ivf_pq_on_cuvs_rust_impl = getattr(
+        _lance_ext.indices, "_assign_ivf_pq_on_cuvs_rust"
+    )
+    _train_ivf_pq_on_cuvs_rust_impl = getattr(
+        _lance_ext.indices, "_train_ivf_pq_on_cuvs_rust"
+    )
+except (ImportError, AttributeError):
+    _assign_ivf_pq_on_cuvs_rust_impl = None
+    _train_ivf_pq_on_cuvs_rust_impl = None
+
+
+def _has_rust_cuvs_backend() -> bool:
+    return (
+        _train_ivf_pq_on_cuvs_rust_impl is not None
+        and _assign_ivf_pq_on_cuvs_rust_impl is not None
+    )
+
+def _unwrap_dataset(dataset):
+    return getattr(dataset, "_ds", dataset)
 
 
 def is_cuvs_accelerator(accelerator: object) -> bool:
@@ -170,6 +202,97 @@ def _as_numpy(array_like) -> np.ndarray:
     raise TypeError("Unable to convert cuVS output to numpy")
 
 
+def _normalize_artifact_root(path_or_uri: str | Path) -> str:
+    root = str(path_or_uri)
+    if re.search(r".:\\", root) is not None:
+        root = root.replace("\\", "/", 1)
+    return root
+
+
+def _make_metadata_table(
+    ivf_centroids: np.ndarray,
+    pq_codebook: np.ndarray,
+) -> pa.Table:
+    dimension = ivf_centroids.shape[1]
+    subvector_dim = pq_codebook.shape[2]
+    ivf_type = pa.list_(pa.list_(pa.float32(), dimension))
+    pq_type = pa.list_(pa.list_(pa.float32(), subvector_dim))
+    ivf_values = pa.array([ivf_centroids.tolist()], type=ivf_type)
+    pq_values = pa.array(
+        [pq_codebook.reshape(-1, subvector_dim).tolist()],
+        type=pq_type,
+    )
+    return pa.Table.from_arrays(
+        [ivf_values, pq_values],
+        names=["_ivf_centroids", "_pq_codebook"],
+    )
+
+
+def _write_partition_artifact_metadata(
+    session: LanceFileSession,
+    *,
+    ivf_centroids: np.ndarray,
+    pq_codebook: np.ndarray,
+    metric_type: str,
+    num_bits: int,
+) -> None:
+    metadata_table = _make_metadata_table(ivf_centroids, pq_codebook)
+    with session.open_writer(
+        PARTITION_ARTIFACT_METADATA_FILE_NAME,
+        schema=metadata_table.schema,
+        version="2.2",
+    ) as writer:
+        writer.add_schema_metadata("lance:index_build:artifact_version", "1")
+        writer.add_schema_metadata(
+            "lance:index_build:distance_type", _normalize_metric_type(metric_type)
+        )
+        writer.add_schema_metadata(
+            "lance:index_build:num_partitions", str(ivf_centroids.shape[0])
+        )
+        writer.add_schema_metadata(
+            "lance:index_build:num_sub_vectors", str(pq_codebook.shape[0])
+        )
+        writer.add_schema_metadata("lance:index_build:num_bits", str(num_bits))
+        writer.add_schema_metadata("lance:index_build:dimension", str(ivf_centroids.shape[1]))
+        writer.write_batch(metadata_table)
+
+
+def _write_partition_artifact(
+    batches: Iterator[pa.RecordBatch],
+    *,
+    artifact_root: str | Path,
+    ivf_centroids: np.ndarray,
+    pq_codebook: np.ndarray,
+    metric_type: str,
+    num_bits: int,
+    num_partitions: int,
+    total_loss: float | None = None,
+) -> tuple[str, list[str]]:
+    artifact_root = _normalize_artifact_root(artifact_root)
+    session = LanceFileSession(artifact_root)
+    builder = PartitionArtifactBuilder(
+        artifact_root,
+        num_partitions=num_partitions,
+        pq_code_width=pq_codebook.shape[0],
+    )
+    for batch in batches:
+        builder.append_batch(batch)
+
+    _write_partition_artifact_metadata(
+        session,
+        ivf_centroids=ivf_centroids,
+        pq_codebook=pq_codebook,
+        metric_type=metric_type,
+        num_bits=num_bits,
+    )
+    artifact_files = builder.finish(
+        PARTITION_ARTIFACT_METADATA_FILE_NAME,
+        float(total_loss) if total_loss is not None else None,
+    )
+    artifact_files.insert(1, PARTITION_ARTIFACT_METADATA_FILE_NAME)
+    return artifact_root, artifact_files
+
+
 def _to_cuvs_transform_input(matrix: np.ndarray):
     cupy = _optional_cupy()
     if cupy is None:
@@ -251,6 +374,19 @@ def _train_ivf_pq_index_on_cuvs(
     num_bits: int = 8,
     filter_nan: bool = True,
 ):
+    if _has_rust_cuvs_backend():
+        return _train_ivf_pq_on_cuvs_rust_impl(
+            _unwrap_dataset(dataset),
+            column,
+            num_partitions,
+            metric_type,
+            num_sub_vectors,
+            sample_rate=sample_rate,
+            max_iters=max_iters,
+            num_bits=num_bits,
+            filter_nan=filter_nan,
+        )
+
     if accelerator != "cuvs":
         raise ValueError("cuVS acceleration only supports accelerator='cuvs'")
     if num_bits != 8:
@@ -310,7 +446,26 @@ def one_pass_assign_ivf_pq_on_cuvs(
     *,
     filter_nan: bool = True,
 ):
-    from . import write_dataset
+    if _has_rust_cuvs_backend():
+        if accelerator != "cuvs":
+            raise ValueError("cuVS acceleration only supports accelerator='cuvs'")
+        if trained_index is None:
+            raise ValueError(
+                "one_pass_assign_ivf_pq_on_cuvs requires a trained cuVS index for "
+                "single-node transform"
+            )
+        if dst_dataset_uri is None:
+            dst_dataset_uri = tempfile.mkdtemp()
+        artifact_files = _assign_ivf_pq_on_cuvs_rust_impl(
+            _unwrap_dataset(dataset),
+            column,
+            trained_index,
+            str(dst_dataset_uri),
+            batch_size=batch_size,
+            filter_nan=filter_nan,
+        )
+        LOGGER.info("Saved precomputed partition artifact to %s", dst_dataset_uri)
+        return str(dst_dataset_uri), artifact_files
 
     if accelerator != "cuvs":
         raise ValueError("cuVS acceleration only supports accelerator='cuvs'")
@@ -346,7 +501,7 @@ def one_pass_assign_ivf_pq_on_cuvs(
 
     output_schema = pa.schema(
         [
-            pa.field("row_id", pa.uint64()),
+            pa.field(PARTITION_ARTIFACT_ROW_ID_COLUMN, pa.uint64()),
             pa.field("__ivf_part_id", pa.uint32()),
             pa.field("__pq_code", pa.list_(pa.uint8(), list_size=num_sub_vectors)),
         ]
@@ -399,28 +554,19 @@ def one_pass_assign_ivf_pq_on_cuvs(
 
     if dst_dataset_uri is None:
         dst_dataset_uri = tempfile.mkdtemp()
-        if re.search(r".:\\", dst_dataset_uri) is not None:
-            dst_dataset_uri = dst_dataset_uri.replace("\\", "/", 1)
-
-    reader = pa.RecordBatchReader.from_batches(
-        output_schema, _partition_and_pq_codes_assignment()
+    artifact_root, artifact_files = _write_partition_artifact(
+        _partition_and_pq_codes_assignment(),
+        artifact_root=dst_dataset_uri,
+        ivf_centroids=ivf_centroids,
+        pq_codebook=pq_codebook,
+        metric_type=metric_type,
+        num_bits=8,
+        num_partitions=num_partitions,
     )
-    ds = write_dataset(
-        reader,
-        dst_dataset_uri,
-        schema=output_schema,
-        data_storage_version="2.2",
-    )
-    _annotate_precomputed_encoded_dataset(
-        ds, partition_sizes.astype(int).tolist()
-    )
-    shuffle_buffers = [
-        data_file.path for frag in ds.get_fragments() for data_file in frag.data_files()
-    ]
 
     progress.close()
-    LOGGER.info("Saved precomputed pq_codes to %s", dst_dataset_uri)
-    return str(dst_dataset_uri), shuffle_buffers
+    LOGGER.info("Saved precomputed partition artifact to %s", artifact_root)
+    return str(artifact_root), artifact_files
 
 
 def train_ivf_pq_on_cuvs(

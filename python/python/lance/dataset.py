@@ -2985,7 +2985,7 @@ class LanceDataset(pa.dataset.Dataset):
                 )
                 LOGGER.info("cuVS ivf+pq training time: %ss", ivfpq_train_time)
                 timers["ivf+pq_assign:start"] = time.time()
-                shuffle_output_dir, _ = one_pass_assign_ivf_pq_on_cuvs(
+                artifact_root, _ = one_pass_assign_ivf_pq_on_cuvs(
                     self,
                     column[0],
                     metric,
@@ -2996,12 +2996,12 @@ class LanceDataset(pa.dataset.Dataset):
                     batch_size=1024 * 128,
                     filter_nan=filter_nan,
                 )
+                kwargs["precomputed_partition_artifact_uri"] = artifact_root
                 timers["ivf+pq_assign:end"] = time.time()
                 ivfpq_assign_time = (
                     timers["ivf+pq_assign:end"] - timers["ivf+pq_assign:start"]
                 )
                 LOGGER.info("cuVS ivf+pq transform time: %ss", ivfpq_assign_time)
-                kwargs["precomputed_encoded_dataset_uri"] = shuffle_output_dir
             else:
                 from .vector import (
                     one_pass_assign_ivf_pq_on_accelerator,
@@ -3215,6 +3215,13 @@ class LanceDataset(pa.dataset.Dataset):
             LOGGER.info(
                 "Temporary precomputed encoded dataset stored at %s, you may want to delete it.",
                 kwargs["precomputed_encoded_dataset_uri"],
+            )
+        if "precomputed_partition_artifact_uri" in kwargs.keys() and os.path.exists(
+            kwargs["precomputed_partition_artifact_uri"]
+        ):
+            LOGGER.info(
+                "Temporary precomputed partition artifact stored at %s, you may want to delete it.",
+                kwargs["precomputed_partition_artifact_uri"],
             )
         return index
 

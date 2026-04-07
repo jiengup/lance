@@ -3375,6 +3375,10 @@ fn prepare_vector_index_params(
             ivf_params.precomputed_encoded_dataset_uri = Some(uri.to_string());
         };
 
+        if let Some(uri) = kwargs.get_item("precomputed_partition_artifact_uri")? {
+            ivf_params.precomputed_partition_artifact_uri = Some(uri.to_string());
+        };
+
         if let Some(storage_options) = storage_options {
             ivf_params.storage_options = Some(storage_options);
         }

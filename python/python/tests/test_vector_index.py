@@ -22,10 +22,16 @@ import pyarrow.compute as pc
 import pytest
 from lance import LanceDataset, LanceFragment
 from lance.dataset import VectorIndexReader
+from lance.file import LanceFileReader
 from lance.indices import IndexFileVersion, IndicesBuilder
 from lance.query import MatchQuery, PhraseQuery
 from lance.util import validate_vector_index  # noqa: E402
 from lance.vector import vec_to_table  # noqa: E402
+
+
+def _disable_rust_cuvs_backend(monkeypatch):
+    monkeypatch.setattr(lance_cuvs, "_train_ivf_pq_on_cuvs_rust_impl", None)
+    monkeypatch.setattr(lance_cuvs, "_assign_ivf_pq_on_cuvs_rust_impl", None)
 
 
 def create_table(nvec=1000, ndim=128, nans=0, nullify=False, dtype=np.float32):
@@ -585,8 +591,8 @@ def test_create_index_cuvs_dispatch(tmp_path, monkeypatch):
         accelerator,
         ivf_centroids,
         pq_codebook,
-        trained_index=None,
-        dst_dataset_uri=None,
+        trained_index,
+        dst_path=None,
         batch_size=20480,
         *,
         filter_nan,
@@ -595,36 +601,23 @@ def test_create_index_cuvs_dispatch(tmp_path, monkeypatch):
         calls["assign_column"] = column
         calls["assign_metric_type"] = metric_type
         calls["assign_accelerator"] = accelerator
+        calls["assign_ivf_centroids"] = ivf_centroids
+        calls["assign_pq_codebook"] = pq_codebook
         calls["assign_trained_index"] = trained_index
         calls["assign_batch_size"] = batch_size
         calls["assign_filter_nan"] = filter_nan
-
-        row_ids = dataset_arg.to_table(columns=[], with_row_id=True)[
-            "_rowid"
-        ].to_numpy()
-        part_ids = pa.array(np.zeros(len(row_ids), dtype=np.uint32))
-        pq_values = pa.array(np.zeros(len(row_ids) * 16, dtype=np.uint8))
-        pq_codes = pa.FixedSizeListArray.from_arrays(pq_values, 16)
-        shuffle_ds_uri = str(tmp_path / "cuvs_shuffle_buffers")
-        shuffle_ds = lance.write_dataset(
-            pa.Table.from_arrays(
-                [pa.array(row_ids), part_ids, pq_codes],
-                names=["row_id", "__ivf_part_id", "__pq_code"],
-            ),
-            shuffle_ds_uri,
-        )
-        lance_cuvs._annotate_precomputed_encoded_dataset(
-            shuffle_ds, [len(row_ids), 0, 0, 0]
-        )
-        shuffle_buffers = [
-            data_file.path
-            for frag in shuffle_ds.get_fragments()
-            for data_file in frag.data_files()
+        return str(tmp_path / "cuvs_artifact"), [
+            "manifest.json",
+            "metadata.lance",
+            "partitions/bucket-00000.lance",
         ]
-        return shuffle_ds_uri, shuffle_buffers
 
     monkeypatch.setattr(lance_cuvs, "_train_ivf_pq_index_on_cuvs", fake_train)
-    monkeypatch.setattr(lance_cuvs, "one_pass_assign_ivf_pq_on_cuvs", fake_assign)
+    monkeypatch.setattr(
+        lance_cuvs,
+        "one_pass_assign_ivf_pq_on_cuvs",
+        fake_assign,
+    )
 
     dataset = dataset.create_index(
         "vector",
@@ -712,6 +705,7 @@ def test_prepare_global_ivf_pq_cuvs_dispatch(tmp_path, monkeypatch):
 
 
 def test_train_ivf_pq_on_cuvs_nullable_vectors(tmp_path, monkeypatch):
+    _disable_rust_cuvs_backend(monkeypatch)
     tbl = create_table(nvec=32, ndim=16, nullify=True)
     dataset = lance.write_dataset(tbl, tmp_path)
 
@@ -747,9 +741,59 @@ def test_train_ivf_pq_on_cuvs_nullable_vectors(tmp_path, monkeypatch):
     assert pq_codebook.shape == (4, 256, 4)
 
 
+def test_train_ivf_pq_on_cuvs_prefers_rust_backend(tmp_path, monkeypatch):
+    dataset = lance.write_dataset(create_table(nvec=32, ndim=16), tmp_path)
+    calls = {}
+
+    class FakeRustIndex:
+        pass
+
+    def fake_train(*args, **kwargs):
+        calls["args"] = args
+        calls["kwargs"] = kwargs
+        return (
+            FakeRustIndex(),
+            pa.FixedSizeListArray.from_arrays(
+                pa.array(np.arange(64, dtype=np.float32)), 16
+            ),
+            pa.FixedSizeListArray.from_arrays(
+                pa.array(np.arange(4 * 256 * 4, dtype=np.float32)), 4
+            ),
+        )
+
+    monkeypatch.setattr(lance_cuvs, "_train_ivf_pq_on_cuvs_rust_impl", fake_train)
+    monkeypatch.setattr(lance_cuvs, "_assign_ivf_pq_on_cuvs_rust_impl", object())
+    monkeypatch.setattr(
+        lance_cuvs,
+        "_require_cuvs",
+        lambda: (_ for _ in ()).throw(AssertionError("python cuVS backend should not run")),
+    )
+
+    trained_index, centroids, pq_codebook = lance_cuvs._train_ivf_pq_index_on_cuvs(
+        dataset,
+        "vector",
+        4,
+        "l2",
+        "cuvs",
+        4,
+        sample_rate=8,
+        max_iters=30,
+        num_bits=8,
+        filter_nan=True,
+    )
+
+    assert isinstance(trained_index, FakeRustIndex)
+    assert calls["args"][:5] == (dataset, "vector", 4, "l2", 4)
+    assert calls["kwargs"]["sample_rate"] == 8
+    assert calls["kwargs"]["max_iters"] == 30
+    assert isinstance(centroids, pa.FixedSizeListArray)
+    assert isinstance(pq_codebook, pa.FixedSizeListArray)
+
+
 def test_train_ivf_pq_on_cuvs_uses_num_sub_vectors_for_pq_dim(
     tmp_path, monkeypatch
 ):
+    _disable_rust_cuvs_backend(monkeypatch)
     dataset = lance.write_dataset(create_table(nvec=32, ndim=16), tmp_path)
     calls = {}
 
@@ -836,7 +880,8 @@ def test_annotate_precomputed_encoded_dataset_scans_fragment_directly(tmp_path):
     assert partition_fragments == [[0], [0], [1], [1]]
 
 
-def test_one_pass_assign_ivf_pq_on_cuvs_writes_encoded_dataset(tmp_path, monkeypatch):
+def test_one_pass_assign_ivf_pq_on_cuvs_writes_partition_artifact(tmp_path, monkeypatch):
+    _disable_rust_cuvs_backend(monkeypatch)
     tbl = create_table(nvec=32, ndim=16)
     dataset = lance.write_dataset(tbl, tmp_path / "cuvs_assign_src")
 
@@ -875,7 +920,7 @@ def test_one_pass_assign_ivf_pq_on_cuvs_writes_encoded_dataset(tmp_path, monkeyp
     monkeypatch.setattr(lance_cuvs, "_require_cuvs", lambda: FakeIvfPqModule())
     monkeypatch.setattr(lance_cuvs, "_optional_cupy", lambda: FakeCupyModule())
 
-    shuffle_uri, shuffle_buffers = lance_cuvs.one_pass_assign_ivf_pq_on_cuvs(
+    artifact_root, artifact_files = lance_cuvs.one_pass_assign_ivf_pq_on_cuvs(
         dataset,
         "vector",
         "l2",
@@ -886,33 +931,82 @@ def test_one_pass_assign_ivf_pq_on_cuvs_writes_encoded_dataset(tmp_path, monkeyp
         batch_size=8,
     )
 
-    shuffle_ds = lance.dataset(shuffle_uri)
-    data_batch = next(shuffle_ds.to_batches(batch_size=1024))
+    manifest_path = Path(artifact_root) / lance_cuvs.PARTITION_ARTIFACT_MANIFEST_FILE_NAME
+    metadata_path = Path(artifact_root) / lance_cuvs.PARTITION_ARTIFACT_METADATA_FILE_NAME
 
-    assert len(shuffle_buffers) > 0
-    assert all(path.endswith(".lance") for path in shuffle_buffers)
-    assert data_batch.column("row_id").type == pa.uint64()
-    assert data_batch.column("__ivf_part_id").type == pa.uint32()
-    assert data_batch.column("__pq_code").type == pa.list_(pa.uint8(), 4)
-    metadata = shuffle_ds.metadata()
-    assert json.loads(
-        metadata[
-            lance_cuvs.PRECOMPUTED_ENCODED_PARTITION_SIZES_METADATA_KEY
-        ]
-    ) == [8, 8, 8, 8]
-    partition_fragments = json.loads(
-        metadata[
-            lance_cuvs.PRECOMPUTED_ENCODED_PARTITION_FRAGMENT_IDS_METADATA_KEY
-        ]
+    assert manifest_path.exists()
+    assert metadata_path.exists()
+    assert any(path.endswith(".lance") for path in artifact_files)
+
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["version"] == lance_cuvs.PARTITION_ARTIFACT_MANIFEST_VERSION
+    assert manifest["num_partitions"] == 4
+    assert manifest["metadata_file"] == lance_cuvs.PARTITION_ARTIFACT_METADATA_FILE_NAME
+    assert [entry["num_rows"] for entry in manifest["partitions"]] == [8, 8, 8, 8]
+    assert all(entry["path"] for entry in manifest["partitions"])
+    assert all(entry["ranges"] for entry in manifest["partitions"])
+
+    metadata_reader = LanceFileReader(str(metadata_path))
+    metadata_table = metadata_reader.read_all().to_table()
+    assert metadata_table.column("_ivf_centroids").type == pa.list_(pa.list_(pa.float32(), 16))
+    assert metadata_table.column("_pq_codebook").type == pa.list_(pa.list_(pa.float32(), 4))
+
+    bucket_path = Path(artifact_root) / manifest["partitions"][0]["path"]
+    bucket_reader = LanceFileReader(str(bucket_path))
+    bucket_table = bucket_reader.read_all().to_table()
+    assert bucket_table.column("_rowid").type == pa.uint64()
+    assert bucket_table.column("__pq_code").type == pa.list_(pa.uint8(), 4)
+
+
+def test_one_pass_assign_ivf_pq_on_cuvs_prefers_rust_backend(tmp_path, monkeypatch):
+    dataset = lance.write_dataset(create_table(nvec=32, ndim=16), tmp_path / "cuvs_assign_rust")
+    calls = {}
+
+    class FakeRustIndex:
+        pass
+
+    def fake_assign(*args, **kwargs):
+        calls["args"] = args
+        calls["kwargs"] = kwargs
+        return ["manifest.json", "metadata.lance", "partitions/bucket-00000.lance"]
+
+    monkeypatch.setattr(lance_cuvs, "_train_ivf_pq_on_cuvs_rust_impl", object())
+    monkeypatch.setattr(lance_cuvs, "_assign_ivf_pq_on_cuvs_rust_impl", fake_assign)
+    monkeypatch.setattr(
+        lance_cuvs,
+        "_require_cuvs",
+        lambda: (_ for _ in ()).throw(AssertionError("python cuVS backend should not run")),
     )
-    assert len(partition_fragments) == 4
-    assert all(partition_fragments)
+
+    artifact_root, artifact_files = lance_cuvs.one_pass_assign_ivf_pq_on_cuvs(
+        dataset,
+        "vector",
+        "l2",
+        "cuvs",
+        np.random.randn(4, 16).astype(np.float32),
+        np.random.randn(4, 256, 4).astype(np.float32),
+        trained_index=FakeRustIndex(),
+        dst_dataset_uri=tmp_path / "artifact",
+        batch_size=4096,
+    )
+
+    assert artifact_root == str(tmp_path / "artifact")
+    assert artifact_files[0] == "manifest.json"
+    assert calls["args"][:4] == (
+        dataset,
+        "vector",
+        calls["args"][2],
+        str(tmp_path / "artifact"),
+    )
+    assert isinstance(calls["args"][2], FakeRustIndex)
+    assert calls["kwargs"]["batch_size"] == 4096
 
 
 def test_one_pass_assign_ivf_pq_on_cuvs_rejects_incompatible_transform_width(
     tmp_path,
     monkeypatch,
 ):
+    _disable_rust_cuvs_backend(monkeypatch)
     tbl = create_table(nvec=32, ndim=128)
     dataset = lance.write_dataset(tbl, tmp_path / "cuvs_assign_incompatible")
 
