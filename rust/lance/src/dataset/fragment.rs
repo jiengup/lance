@@ -3894,6 +3894,7 @@ mod tests {
 
         let op = Operation::Append {
             fragments: vec![frag],
+            row_ids: None,
         };
         let dataset = Dataset::commit(
             &dataset.uri,

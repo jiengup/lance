@@ -133,7 +133,11 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
 mod test {
     use std::ops::Range;
 
-    use crate::dataset::{UpdateBuilder, WriteMode, WriteParams, builder::DatasetBuilder};
+    use crate::dataset::transaction::{Operation, TransactionBuilder};
+    use crate::dataset::{
+        CommitBuilder, InsertBuilder, ReservedRowIds, UpdateBuilder, WriteMode, WriteParams,
+        builder::DatasetBuilder,
+    };
 
     use super::*;
 
@@ -315,6 +319,136 @@ mod test {
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(0).is_some());
         assert!(index.get(60).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_append_with_reserved_row_ids() {
+        let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let tmp_path = &temp_dir;
+        let schema = sequence_batch(0..0).schema();
+        let reader = RecordBatchIterator::new(vec![].into_iter().map(Ok), schema);
+        let dataset = Dataset::write(
+            reader,
+            tmp_path,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let reserve_txn = TransactionBuilder::new(
+            dataset.manifest().version,
+            Operation::ReserveRowIds { num_rows: 6 },
+        )
+        .build();
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(reserve_txn)
+            .await
+            .unwrap();
+
+        let reserved = dataset.latest_reserved_row_ids().await.unwrap().unwrap();
+        assert_eq!(dataset.reserved_row_ids(), &[reserved.clone()]);
+
+        let append_params = WriteParams {
+            mode: WriteMode::Append,
+            max_rows_per_file: 2,
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_row_ids(ReservedRowIds {
+                start_row_id: reserved.start_row_id + 2,
+                count: 4,
+            })
+            .with_params(&append_params)
+            .execute(vec![sequence_batch(100..104)])
+            .await
+            .unwrap();
+
+        assert!(dataset.reserved_row_ids().is_empty());
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let batch = dataset
+            .scan()
+            .with_row_id()
+            .project(&["id"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let row_ids = batch[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(row_ids, vec![2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn test_append_with_reserved_row_ids_conflict() {
+        let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let tmp_path = &temp_dir;
+        let schema = sequence_batch(0..0).schema();
+        let reader = RecordBatchIterator::new(vec![].into_iter().map(Ok), schema);
+        let dataset = Dataset::write(
+            reader,
+            tmp_path,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let reserve_txn = TransactionBuilder::new(
+            dataset.manifest().version,
+            Operation::ReserveRowIds { num_rows: 6 },
+        )
+        .build();
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(reserve_txn)
+            .await
+            .unwrap();
+        let reserved = dataset.latest_reserved_row_ids().await.unwrap().unwrap();
+
+        let append_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let first_transaction = InsertBuilder::new(Arc::new(dataset.clone()))
+            .with_row_ids(ReservedRowIds {
+                start_row_id: reserved.start_row_id + 1,
+                count: 4,
+            })
+            .with_params(&append_params)
+            .execute_uncommitted(vec![sequence_batch(100..104)])
+            .await
+            .unwrap();
+        let second_transaction = InsertBuilder::new(Arc::new(dataset.clone()))
+            .with_row_ids(ReservedRowIds {
+                start_row_id: reserved.start_row_id + 3,
+                count: 2,
+            })
+            .with_params(&append_params)
+            .execute_uncommitted(vec![sequence_batch(200..202)])
+            .await
+            .unwrap();
+
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(first_transaction)
+            .await
+            .unwrap();
+
+        let result = CommitBuilder::new(Arc::new(dataset))
+            .execute(second_transaction)
+            .await;
+
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::CommitConflict { .. }));
+        assert!(err.to_string().contains("Reserved row ids overlap"));
     }
 
     #[tokio::test]

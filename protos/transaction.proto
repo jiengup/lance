@@ -39,6 +39,12 @@ message Transaction {
     //
     // Fragment IDs are not yet assigned.
     repeated DataFragment fragments = 1;
+    // Stable row ids to assign to the new rows, if pre-reserved.
+    //
+    // The requested range must be contained within a currently active
+    // reservation. Once this append commits, that reservation is consumed as a
+    // one-time token, even if this append only uses a subrange.
+    ReservedRowIds row_ids = 2;
   }
 
   // Mark rows as deleted.
@@ -162,6 +168,11 @@ message Transaction {
   // a rewrite operation.
   message ReserveFragments {
     uint32 num_fragments = 1;
+  }
+
+  // An operation that reserves stable row ids for a future append.
+  message ReserveRowIds {
+    uint64 num_rows = 1;
   }
 
   // An operation that clones a dataset.
@@ -339,6 +350,7 @@ message Transaction {
     UpdateMemWalState update_mem_wal_state = 112;
     Clone clone = 113;
     UpdateBases update_bases = 114;
+    ReserveRowIds reserve_row_ids = 115;
   }
 
   // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented blob dataset ops.

@@ -28,7 +28,7 @@ use lance_table::rowids::read_row_ids;
 use lance_table::{
     format::{
         BasePath, DataFile, DataStorageFormat, Fragment, IndexFile, IndexMetadata, Manifest,
-        RowIdMeta, pb,
+        ReservedRowIds, RowIdMeta, pb,
     },
     io::{
         commit::CommitHandler,
@@ -44,6 +44,8 @@ use std::{
     sync::Arc,
 };
 use uuid::Uuid;
+
+const MAX_RESERVED_ROW_ID_RANGES: usize = 3;
 
 /// A change to a dataset that can be retried
 ///
@@ -113,7 +115,10 @@ pub struct UpdateMap {
 pub enum Operation {
     /// Adding new fragments to the dataset. The fragments contained within
     /// haven't yet been assigned a final ID.
-    Append { fragments: Vec<Fragment> },
+    Append {
+        fragments: Vec<Fragment>,
+        row_ids: Option<ReservedRowIds>,
+    },
     /// Updated fragments contain those that have been modified with new deletion
     /// files. The deleted fragment IDs are those that should be removed from
     /// the manifest.
@@ -186,6 +191,11 @@ pub enum Operation {
     /// has been committed.  It is used during a rewrite operation to allow
     /// indices to be remapped to the new row ids as part of the operation.
     ReserveFragments { num_fragments: u32 },
+    /// Reserves stable row ids for a future append operation.
+    ///
+    /// Reservations belong to the current version line and are not inherited by
+    /// later shallow clones.
+    ReserveRowIds { num_rows: u64 },
 
     /// Update values in the dataset.
     ///
@@ -281,6 +291,7 @@ impl std::fmt::Display for Operation {
             Self::Merge { .. } => write!(f, "Merge"),
             Self::Restore { .. } => write!(f, "Restore"),
             Self::ReserveFragments { .. } => write!(f, "ReserveFragments"),
+            Self::ReserveRowIds { .. } => write!(f, "ReserveRowIds"),
             Self::Update { .. } => write!(f, "Update"),
             Self::Project { .. } => write!(f, "Project"),
             Self::UpdateConfig { .. } => write!(f, "UpdateConfig"),
@@ -312,7 +323,16 @@ impl PartialEq for Operation {
             a.len() == b.len() && a.iter().all(|f| b.contains(f))
         }
         match (self, other) {
-            (Self::Append { fragments: a }, Self::Append { fragments: b }) => compare_vec(a, b),
+            (
+                Self::Append {
+                    fragments: a_fragments,
+                    row_ids: a_row_ids,
+                },
+                Self::Append {
+                    fragments: b_fragments,
+                    row_ids: b_row_ids,
+                },
+            ) => compare_vec(a_fragments, b_fragments) && a_row_ids == b_row_ids,
             (
                 Self::Clone {
                     is_shallow: a_is_shallow,
@@ -411,6 +431,7 @@ impl PartialEq for Operation {
                 Self::ReserveFragments { num_fragments: a },
                 Self::ReserveFragments { num_fragments: b },
             ) => a == b,
+            (Self::ReserveRowIds { num_rows: a }, Self::ReserveRowIds { num_rows: b }) => a == b,
             (
                 Self::Update {
                     removed_fragment_ids: a_removed,
@@ -1128,6 +1149,96 @@ impl PartialEq for Operation {
             (Self::Clone { .. }, Self::UpdateBases { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            (Self::ReserveRowIds { .. }, Self::Append { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveRowIds { .. }, Self::Delete { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveRowIds { .. }, Self::Overwrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveRowIds { .. }, Self::CreateIndex { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveRowIds { .. }, Self::Rewrite { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveRowIds { .. }, Self::Merge { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveRowIds { .. }, Self::Restore { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveRowIds { .. }, Self::ReserveFragments { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveRowIds { .. }, Self::Update { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveRowIds { .. }, Self::Project { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveRowIds { .. }, Self::UpdateConfig { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveRowIds { .. }, Self::DataReplacement { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveRowIds { .. }, Self::UpdateMemWalState { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveRowIds { .. }, Self::Clone { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveRowIds { .. }, Self::UpdateBases { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Append { .. }, Self::ReserveRowIds { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Delete { .. }, Self::ReserveRowIds { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Overwrite { .. }, Self::ReserveRowIds { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::CreateIndex { .. }, Self::ReserveRowIds { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Rewrite { .. }, Self::ReserveRowIds { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Merge { .. }, Self::ReserveRowIds { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Restore { .. }, Self::ReserveRowIds { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::ReserveFragments { .. }, Self::ReserveRowIds { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Update { .. }, Self::ReserveRowIds { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Project { .. }, Self::ReserveRowIds { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateConfig { .. }, Self::ReserveRowIds { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::DataReplacement { .. }, Self::ReserveRowIds { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateMemWalState { .. }, Self::ReserveRowIds { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::Clone { .. }, Self::ReserveRowIds { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
+            (Self::UpdateBases { .. }, Self::ReserveRowIds { .. }) => {
+                std::mem::discriminant(self) == std::mem::discriminant(other)
+            }
         }
     }
 }
@@ -1273,6 +1384,7 @@ impl Operation {
             Self::Rewrite { .. } => "Rewrite",
             Self::Merge { .. } => "Merge",
             Self::ReserveFragments { .. } => "ReserveFragments",
+            Self::ReserveRowIds { .. } => "ReserveRowIds",
             Self::Restore { .. } => "Restore",
             Self::Update { .. } => "Update",
             Self::Project { .. } => "Project",
@@ -1492,6 +1604,27 @@ impl Transaction {
         }
     }
 
+    fn reserved_row_ids_end(row_ids: &ReservedRowIds) -> Result<u64> {
+        row_ids
+            .start_row_id
+            .checked_add(row_ids.count)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "reserved row ids overflow: start_row_id={}, count={}",
+                    row_ids.start_row_id, row_ids.count
+                ))
+            })
+    }
+
+    fn reserved_row_ids_contains(
+        reserved: &ReservedRowIds,
+        requested: &ReservedRowIds,
+    ) -> Result<bool> {
+        let reserved_end = Self::reserved_row_ids_end(reserved)?;
+        let requested_end = Self::reserved_row_ids_end(requested)?;
+        Ok(reserved.start_row_id <= requested.start_row_id && requested_end <= reserved_end)
+    }
+
     pub(crate) async fn restore_old_manifest(
         object_store: &ObjectStore,
         commit_handler: &dyn CommitHandler,
@@ -1607,6 +1740,9 @@ impl Transaction {
                 }
             }
         };
+        let mut reserved_row_ids = current_manifest
+            .map(|manifest| manifest.reserved_row_ids.clone())
+            .unwrap_or_default();
 
         let maybe_existing_fragments =
             current_manifest
@@ -1624,13 +1760,45 @@ impl Transaction {
                     "Clone operation should not enter build_manifest.".to_string(),
                 ));
             }
-            Operation::Append { fragments } => {
+            Operation::Append { fragments, row_ids } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let mut new_fragments =
                     Self::fragments_with_ids(fragments.clone(), &mut fragment_id)
                         .collect::<Vec<_>>();
-                if let Some(next_row_id) = &mut next_row_id {
-                    Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                match (&mut next_row_id, row_ids) {
+                    (Some(_), Some(row_ids)) => {
+                        let mut reservation_pos = None;
+                        for (idx, reserved) in reserved_row_ids.iter().enumerate() {
+                            if Self::reserved_row_ids_contains(reserved, row_ids)? {
+                                reservation_pos = Some(idx);
+                                break;
+                            }
+                        }
+                        let reservation_pos = reservation_pos
+                            .ok_or_else(|| {
+                                Error::invalid_input(format!(
+                                    "Reserved row ids start_row_id={} count={} are not contained within any active reservation",
+                                    row_ids.start_row_id, row_ids.count
+                                ))
+                            })?;
+                        Self::assign_reserved_row_ids(row_ids, new_fragments.as_mut_slice())?;
+                        // Reservations are intentionally treated as one-time
+                        // tokens. A partial append still consumes the entire
+                        // reservation instead of leaving behind fragmented
+                        // subranges for future appends.
+                        reserved_row_ids.remove(reservation_pos);
+                    }
+                    (Some(next_row_id), None) => {
+                        Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                    }
+                    (None, Some(_)) => {
+                        return Err(Error::not_supported_source(
+                            "Reserved row ids require a dataset created with stable row ids".into(),
+                        ));
+                    }
+                    (None, None) => {}
+                }
+                if next_row_id.is_some() {
                     // Add version metadata for all new fragments
                     let new_version = current_manifest.map(|m| m.version + 1).unwrap_or(1);
                     for fragment in new_fragments.iter_mut() {
@@ -1956,6 +2124,38 @@ impl Transaction {
             Operation::ReserveFragments { .. } | Operation::UpdateConfig { .. } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
             }
+            Operation::ReserveRowIds { num_rows } => {
+                final_fragments.extend(maybe_existing_fragments?.clone());
+                let next_row_id = next_row_id.as_mut().ok_or_else(|| {
+                    Error::not_supported_source(
+                        "Reserved row ids require a dataset created with stable row ids".into(),
+                    )
+                })?;
+                if *num_rows == 0 {
+                    return Err(Error::invalid_input(
+                        "num_rows must be greater than 0".to_string(),
+                    ));
+                }
+                let start_row_id = *next_row_id;
+                let end_row_id = start_row_id.checked_add(*num_rows).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "next_row_id overflow when reserving row ids: next_row_id={}, num_rows={}",
+                        start_row_id, num_rows
+                    ))
+                })?;
+                if reserved_row_ids.len() >= MAX_RESERVED_ROW_ID_RANGES {
+                    return Err(Error::invalid_input(format!(
+                        "Too many reserved row-id ranges: current={}, max={}",
+                        reserved_row_ids.len(),
+                        MAX_RESERVED_ROW_ID_RANGES
+                    )));
+                }
+                reserved_row_ids.push(ReservedRowIds {
+                    start_row_id,
+                    count: *num_rows,
+                });
+                *next_row_id = end_row_id;
+            }
             Operation::Merge { fragments, .. } => {
                 final_fragments.extend(fragments.clone());
 
@@ -2264,6 +2464,7 @@ impl Transaction {
         if let Some(next_row_id) = next_row_id {
             manifest.next_row_id = next_row_id;
         }
+        manifest.reserved_row_ids = reserved_row_ids;
 
         Ok((manifest, final_indices))
     }
@@ -2690,6 +2891,57 @@ impl Transaction {
         }
         Ok(())
     }
+
+    fn assign_reserved_row_ids(row_ids: &ReservedRowIds, fragments: &mut [Fragment]) -> Result<()> {
+        let total_rows = fragments.iter().try_fold(0_u64, |total_rows, fragment| {
+            let physical_rows = fragment
+                .physical_rows
+                .ok_or_else(|| Error::internal("Fragment does not have physical rows"))?
+                as u64;
+            total_rows.checked_add(physical_rows).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "reserved row id count overflow when summing fragment rows: total_rows={}, fragment_rows={}",
+                    total_rows, physical_rows
+                ))
+            })
+        })?;
+
+        if total_rows != row_ids.count {
+            return Err(Error::invalid_input(format!(
+                "reserved row id count {} does not match appended row count {}",
+                row_ids.count, total_rows
+            )));
+        }
+
+        let mut next_reserved_row_id = row_ids.start_row_id;
+        for fragment in fragments {
+            if fragment.row_id_meta.is_some() {
+                return Err(Error::invalid_input(format!(
+                    "cannot assign reserved row ids to fragment {} because row_id_meta is already present",
+                    fragment.id
+                )));
+            }
+
+            let physical_rows = fragment
+                .physical_rows
+                .ok_or_else(|| Error::internal("Fragment does not have physical rows"))?
+                as u64;
+            let end_row_id =
+                next_reserved_row_id
+                    .checked_add(physical_rows)
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "reserved row id overflow while assigning row ids: start_row_id={}, fragment_rows={}",
+                            next_reserved_row_id, physical_rows
+                        ))
+                    })?;
+            let row_id_sequence = RowIdSequence::from(next_reserved_row_id..end_row_id);
+            fragment.row_id_meta = Some(RowIdMeta::Inline(write_row_ids(&row_id_sequence)));
+            next_reserved_row_id = end_row_id;
+        }
+
+        Ok(())
+    }
 }
 
 impl From<&DataReplacementGroup> for pb::transaction::DataReplacementGroup {
@@ -2724,14 +2976,16 @@ impl TryFrom<pb::Transaction> for Transaction {
 
     fn try_from(message: pb::Transaction) -> Result<Self> {
         let operation = match message.operation {
-            Some(pb::transaction::Operation::Append(pb::transaction::Append { fragments })) => {
-                Operation::Append {
-                    fragments: fragments
-                        .into_iter()
-                        .map(Fragment::try_from)
-                        .collect::<Result<Vec<_>>>()?,
-                }
-            }
+            Some(pb::transaction::Operation::Append(pb::transaction::Append {
+                fragments,
+                row_ids,
+            })) => Operation::Append {
+                fragments: fragments
+                    .into_iter()
+                    .map(Fragment::try_from)
+                    .collect::<Result<Vec<_>>>()?,
+                row_ids: row_ids.map(ReservedRowIds::from),
+            },
             Some(pb::transaction::Operation::Clone(pb::transaction::Clone {
                 is_shallow,
                 ref_name,
@@ -2787,6 +3041,9 @@ impl TryFrom<pb::Transaction> for Transaction {
             Some(pb::transaction::Operation::ReserveFragments(
                 pb::transaction::ReserveFragments { num_fragments },
             )) => Operation::ReserveFragments { num_fragments },
+            Some(pb::transaction::Operation::ReserveRowIds(pb::transaction::ReserveRowIds {
+                num_rows,
+            })) => Operation::ReserveRowIds { num_rows },
             Some(pb::transaction::Operation::Rewrite(pb::transaction::Rewrite {
                 old_fragments,
                 new_fragments,
@@ -3079,9 +3336,10 @@ impl TryFrom<pb::transaction::rewrite::RewriteGroup> for RewriteGroup {
 impl From<&Transaction> for pb::Transaction {
     fn from(value: &Transaction) -> Self {
         let operation = match &value.operation {
-            Operation::Append { fragments } => {
+            Operation::Append { fragments, row_ids } => {
                 pb::transaction::Operation::Append(pb::transaction::Append {
                     fragments: fragments.iter().map(pb::DataFragment::from).collect(),
+                    row_ids: row_ids.as_ref().map(pb::ReservedRowIds::from),
                 })
             }
             Operation::Clone {
@@ -3137,6 +3395,11 @@ impl From<&Transaction> for pb::Transaction {
             Operation::ReserveFragments { num_fragments } => {
                 pb::transaction::Operation::ReserveFragments(pb::transaction::ReserveFragments {
                     num_fragments: *num_fragments,
+                })
+            }
+            Operation::ReserveRowIds { num_rows } => {
+                pb::transaction::Operation::ReserveRowIds(pb::transaction::ReserveRowIds {
+                    num_rows: *num_rows,
                 })
             }
             Operation::Rewrite {
@@ -3345,7 +3608,12 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
     };
 
     match operation {
-        Operation::Append { fragments } => {
+        Operation::Append { fragments, row_ids } => {
+            if row_ids.is_some() && !manifest.uses_stable_row_ids() {
+                return Err(Error::not_supported(
+                    "Reserved row ids require a dataset created with stable row ids",
+                ));
+            }
             // Fragments must contain all fields in the schema
             schema_fragments_valid(Some(manifest), &manifest.schema, fragments)
         }
@@ -3489,6 +3757,7 @@ mod tests {
     use chrono::Utc;
     use lance_core::datatypes::Schema as LanceSchema;
     use lance_io::utils::CachedFileSize;
+    use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -3780,6 +4049,74 @@ mod tests {
         assert_eq!(fragments[0].files.len(), 2);
         assert_eq!(fragments[0].files[0].path, "normal.lance");
         assert_eq!(fragments[0].files[1].path, "mixed.lance");
+    }
+
+    #[test]
+    fn test_reserve_row_ids() {
+        let mut manifest = sample_manifest();
+        manifest.reader_feature_flags = FLAG_STABLE_ROW_IDS;
+        manifest.writer_feature_flags = FLAG_STABLE_ROW_IDS;
+        manifest.next_row_id = 10;
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::ReserveRowIds { num_rows: 5 },
+            None,
+        );
+
+        let (next_manifest, _) = transaction
+            .build_manifest(
+                Some(&manifest),
+                Vec::new(),
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        assert_eq!(next_manifest.next_row_id, 15);
+        assert_eq!(
+            next_manifest.reserved_row_ids,
+            vec![ReservedRowIds {
+                start_row_id: 10,
+                count: 5,
+            }]
+        );
+
+        let mut manifest = next_manifest;
+        for expected_count in [2, 3] {
+            let transaction = Transaction::new(
+                manifest.version,
+                Operation::ReserveRowIds {
+                    num_rows: expected_count,
+                },
+                None,
+            );
+
+            let (next_manifest, _) = transaction
+                .build_manifest(
+                    Some(&manifest),
+                    Vec::new(),
+                    "txn",
+                    &ManifestWriteConfig::default(),
+                )
+                .unwrap();
+            manifest = next_manifest;
+        }
+
+        let result = Transaction::new(
+            manifest.version,
+            Operation::ReserveRowIds { num_rows: 1 },
+            None,
+        )
+        .build_manifest(
+            Some(&manifest),
+            Vec::new(),
+            "txn",
+            &ManifestWriteConfig::default(),
+        );
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("Too many reserved row-id ranges"));
     }
 
     #[test]

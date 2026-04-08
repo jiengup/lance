@@ -1236,7 +1236,10 @@ mod tests {
         let base_path = Path::from("test");
         let transaction = Transaction::new(
             42,
-            Operation::Append { fragments: vec![] },
+            Operation::Append {
+                fragments: vec![],
+                row_ids: None,
+            },
             Some("hello world".to_string()),
         );
 

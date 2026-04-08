@@ -24,6 +24,14 @@ use lance_core::{Error, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
 use lance_io::utils::read_struct;
 
+#[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
+pub struct ReservedRowIds {
+    /// The first stable row id in the reserved range.
+    pub start_row_id: u64,
+    /// The number of stable row ids in the reserved range.
+    pub count: u64,
+}
+
 /// Manifest of a dataset
 ///
 ///  * Schema
@@ -83,7 +91,18 @@ pub struct Manifest {
     fragment_offsets: Vec<usize>,
 
     /// The max row id used so far.
+    ///
+    /// This counter advances with new reservations even though
+    /// [`Self::reserved_row_ids`] only tracks reservations that remain active on
+    /// the current version line.
     pub next_row_id: u64,
+
+    /// Stable row-id reservations that are still active on the current version
+    /// line.
+    ///
+    /// Reservations are one-time tokens for append operations. They are not
+    /// inherited by shallow clones.
+    pub reserved_row_ids: Vec<ReservedRowIds>,
 
     /// The storage format of the data files.
     pub data_storage_format: DataStorageFormat,
@@ -191,6 +210,7 @@ impl Manifest {
             transaction_section: None,
             fragment_offsets,
             next_row_id: 0,
+            reserved_row_ids: Vec::new(),
             data_storage_format,
             config: HashMap::new(),
             table_metadata: HashMap::new(),
@@ -222,6 +242,7 @@ impl Manifest {
             transaction_section: None,
             fragment_offsets,
             next_row_id: previous.next_row_id,
+            reserved_row_ids: previous.reserved_row_ids.clone(),
             data_storage_format: previous.data_storage_format.clone(),
             config: previous.config.clone(),
             table_metadata: previous.table_metadata.clone(),
@@ -233,6 +254,10 @@ impl Manifest {
     /// - Any persistent storage operations
     /// - Modifications to the original data
     /// - If the shallow clone is for branch, ref_name is the source branch
+    ///
+    /// The clone keeps the current `next_row_id` progress but intentionally does
+    /// not copy active reserved row-id ranges. Reservations are scoped to the
+    /// source version line and do not transfer to the new shallow-cloned line.
     pub fn shallow_clone(
         &self,
         ref_name: Option<String>,
@@ -278,6 +303,8 @@ impl Manifest {
             transaction_file: Some(transaction_file),
             transaction_section: None,
             fragment_offsets: self.fragment_offsets.clone(),
+            // Reservations stay on the source version line; the clone only keeps
+            // the next row-id counter.
             next_row_id: self.next_row_id,
             data_storage_format: self.data_storage_format.clone(),
             config: self.config.clone(),
@@ -839,6 +866,24 @@ impl From<BasePath> for pb::BasePath {
     }
 }
 
+impl From<pb::ReservedRowIds> for ReservedRowIds {
+    fn from(value: pb::ReservedRowIds) -> Self {
+        Self {
+            start_row_id: value.start_row_id,
+            count: value.count,
+        }
+    }
+}
+
+impl From<&ReservedRowIds> for pb::ReservedRowIds {
+    fn from(value: &ReservedRowIds) -> Self {
+        Self {
+            start_row_id: value.start_row_id,
+            count: value.count,
+        }
+    }
+}
+
 impl TryFrom<pb::Manifest> for Manifest {
     type Error = Error;
 
@@ -921,6 +966,11 @@ impl TryFrom<pb::Manifest> for Manifest {
             transaction_section: p.transaction_section.map(|i| i as usize),
             fragment_offsets,
             next_row_id: p.next_row_id,
+            reserved_row_ids: p
+                .reserved_row_ids
+                .into_iter()
+                .map(ReservedRowIds::from)
+                .collect(),
             data_storage_format,
             config: p.config,
             table_metadata: p.table_metadata,
@@ -976,6 +1026,11 @@ impl From<&Manifest> for pb::Manifest {
             max_fragment_id: m.max_fragment_id,
             transaction_file: m.transaction_file.clone().unwrap_or_default(),
             next_row_id: m.next_row_id,
+            reserved_row_ids: m
+                .reserved_row_ids
+                .iter()
+                .map(pb::ReservedRowIds::from)
+                .collect(),
             data_format: Some(pb::manifest::DataStorageFormat {
                 file_format: m.data_storage_format.file_format.clone(),
                 version: m.data_storage_format.version.clone(),

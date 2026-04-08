@@ -423,10 +423,11 @@ impl<'a> CommitBuilder<'a> {
         }
         if transactions
             .iter()
-            .any(|t| !matches!(t.operation, Operation::Append { .. }))
+            .any(|t| !matches!(t.operation, Operation::Append { row_ids: None, .. }))
         {
             return Err(Error::not_supported_source(
-                "Only append transactions are supported in batch commits".into(),
+                "Only append transactions without reserved row ids are supported in batch commits"
+                    .into(),
             ));
         }
 
@@ -438,10 +439,11 @@ impl<'a> CommitBuilder<'a> {
                 fragments: transactions
                     .iter()
                     .flat_map(|t| match &t.operation {
-                        Operation::Append { fragments } => fragments.clone(),
+                        Operation::Append { fragments, .. } => fragments.clone(),
                         _ => unreachable!(),
                     })
                     .collect(),
+                row_ids: None,
             },
             read_version,
             tag: None,
@@ -506,6 +508,7 @@ mod tests {
             uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
             operation: Operation::Append {
                 fragments: vec![sample_fragment()],
+                row_ids: None,
             },
             read_version,
             tag: None,
@@ -768,10 +771,10 @@ mod tests {
         let append1 = sample_transaction(1);
         let append2 = sample_transaction(2);
         let mut expected_fragments = vec![];
-        if let Operation::Append { fragments } = &append1.operation {
+        if let Operation::Append { fragments, .. } = &append1.operation {
             expected_fragments.extend(fragments.clone());
         }
-        if let Operation::Append { fragments } = &append2.operation {
+        if let Operation::Append { fragments, .. } = &append2.operation {
             expected_fragments.extend(fragments.clone());
         }
         let res = CommitBuilder::new(dataset.clone())
@@ -780,7 +783,7 @@ mod tests {
             .unwrap();
         let transaction = res.merged;
         assert!(
-            matches!(transaction.operation, Operation::Append { fragments } if fragments == expected_fragments)
+            matches!(transaction.operation, Operation::Append { fragments, .. } if fragments == expected_fragments)
         );
         assert_eq!(transaction.read_version, 1);
     }

@@ -301,7 +301,14 @@ async fn test_inline_transaction() {
     }
 
     fn make_tx(read_version: u64) -> Transaction {
-        Transaction::new(read_version, Operation::Append { fragments: vec![] }, None)
+        Transaction::new(
+            read_version,
+            Operation::Append {
+                fragments: vec![],
+                row_ids: None,
+            },
+            None,
+        )
     }
 
     async fn delete_external_tx_file(ds: &Dataset) {

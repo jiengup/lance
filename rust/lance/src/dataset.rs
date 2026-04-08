@@ -116,6 +116,7 @@ use lance_core::box_error;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
 use lance_table::feature_flags::{apply_feature_flags, can_read_dataset};
+pub use lance_table::format::ReservedRowIds;
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
@@ -405,6 +406,47 @@ impl From<Schema> for ProjectionRequest {
 }
 
 impl Dataset {
+    /// Returns the stable row-id reservations that are still active on this
+    /// dataset version line.
+    ///
+    /// Reservations are consumed as one-time tokens by append commits. If an
+    /// append uses only a subrange, the unused remainder is still discarded.
+    pub fn reserved_row_ids(&self) -> &[ReservedRowIds] {
+        self.manifest.reserved_row_ids.as_slice()
+    }
+
+    /// Returns the stable row-id range reserved by the current dataset version,
+    /// if any.
+    ///
+    /// This only reports the reservation created by the current version's
+    /// `ReserveRowIds` transaction. Reservations are scoped to the current
+    /// version line and are not inherited by shallow clones.
+    pub async fn latest_reserved_row_ids(&self) -> Result<Option<ReservedRowIds>> {
+        let Some(transaction) = self.read_transaction().await? else {
+            return Ok(None);
+        };
+
+        match transaction.operation {
+            Operation::ReserveRowIds { num_rows } => {
+                let start_row_id =
+                    self.manifest
+                        .next_row_id
+                        .checked_sub(num_rows)
+                        .ok_or_else(|| {
+                            Error::internal(format!(
+                                "Manifest next_row_id={} is smaller than reserved num_rows={}",
+                                self.manifest.next_row_id, num_rows
+                            ))
+                        })?;
+                Ok(Some(ReservedRowIds {
+                    start_row_id,
+                    count: num_rows,
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Open an existing dataset.
     ///
     /// See also [DatasetBuilder].

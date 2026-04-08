@@ -14,7 +14,7 @@ use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::can_write_dataset;
-use lance_table::format::Fragment;
+use lance_table::format::{Fragment, ReservedRowIds};
 use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
 
@@ -49,6 +49,7 @@ pub struct InsertBuilder<'a> {
     // TODO: make these parameters a part of the builder, and add specific methods.
     params: Option<&'a WriteParams>,
     write_progress: Option<WriteProgressFn>,
+    row_ids: Option<ReservedRowIds>,
 }
 
 impl<'a> InsertBuilder<'a> {
@@ -57,6 +58,7 @@ impl<'a> InsertBuilder<'a> {
             dest: dest.into(),
             params: None,
             write_progress: None,
+            row_ids: None,
         }
     }
 
@@ -74,6 +76,16 @@ impl<'a> InsertBuilder<'a> {
     /// This overrides any `write_progress` set in [`WriteParams`].
     pub fn progress(mut self, callback: impl Fn(WriteStats) + Send + Sync + 'static) -> Self {
         self.write_progress = Some(WriteProgressFn::new(callback));
+        self
+    }
+
+    /// Use a pre-reserved range of stable row ids for the appended rows.
+    ///
+    /// Reserved row-id ranges are consumed by a single append commit. The
+    /// provided range must come from an active reservation, and any unused
+    /// remainder is discarded once the append commits.
+    pub fn with_row_ids(mut self, row_ids: ReservedRowIds) -> Self {
+        self.row_ids = Some(row_ids);
         self
     }
 
@@ -215,12 +227,13 @@ impl<'a> InsertBuilder<'a> {
         )
         .await?;
 
-        let transaction = Self::build_transaction(written_schema, written_fragments, &context)?;
+        let transaction = self.build_transaction(written_schema, written_fragments, &context)?;
 
         Ok((transaction, context))
     }
 
     fn build_transaction(
+        &self,
         schema: Schema,
         fragments: Vec<Fragment>,
         context: &WriteContext<'_>,
@@ -262,7 +275,10 @@ impl<'a> InsertBuilder<'a> {
                 config_upsert_values: None,
                 initial_bases: context.params.initial_bases.clone(),
             },
-            WriteMode::Append => Operation::Append { fragments },
+            WriteMode::Append => Operation::Append {
+                fragments,
+                row_ids: self.row_ids.clone(),
+            },
         };
 
         let transaction = TransactionBuilder::new(
@@ -281,6 +297,29 @@ impl<'a> InsertBuilder<'a> {
 
     fn validate_write(&self, context: &mut WriteContext, data_schema: &Schema) -> Result<()> {
         // Write mode
+        if self.row_ids.is_some() {
+            match (&context.params.mode, &context.dest) {
+                (WriteMode::Append, WriteDestination::Dataset(dataset)) => {
+                    if !dataset.manifest.uses_stable_row_ids() {
+                        return Err(Error::not_supported_source(
+                            "Reserved row ids require a dataset created with stable row ids".into(),
+                        ));
+                    }
+                }
+                (WriteMode::Append, WriteDestination::Uri(_)) => {
+                    return Err(Error::invalid_input_source(
+                        "Reserved row ids can only be used when appending to an existing dataset"
+                            .into(),
+                    ));
+                }
+                _ => {
+                    return Err(Error::invalid_input_source(
+                        "Reserved row ids can only be used with append writes".into(),
+                    ));
+                }
+            }
+        }
+
         match (&context.params.mode, &context.dest) {
             (WriteMode::Create, WriteDestination::Dataset(ds)) => {
                 return Err(Error::dataset_already_exists(ds.uri.clone()));

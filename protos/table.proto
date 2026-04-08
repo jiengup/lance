@@ -32,6 +32,11 @@ message UUID {
   bytes uuid = 1;
 }
 
+message ReservedRowIds {
+  uint64 start_row_id = 1;
+  uint64 count = 2;
+}
+
 // Manifest is a global section shared between all the files.
 message Manifest {
   // All fields of the dataset, including the nested fields.
@@ -205,6 +210,12 @@ message Manifest {
 
   // The branch of the dataset. None means main branch.
   optional string branch = 20;
+
+  // Stable row-id reservations that are still active on this version line.
+  //
+  // Reservations are one-time tokens for future appends and are not inherited
+  // by shallow clones onto a new version line.
+  repeated ReservedRowIds reserved_row_ids = 22;
 } // Manifest
 
 // external dataset base path
@@ -690,4 +701,3 @@ message ShardField {
   // Transform parameters (e.g., num_buckets for bucket transform).
   map<string, string> parameters = 6;
 }
-
