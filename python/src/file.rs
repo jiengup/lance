@@ -18,7 +18,6 @@ use arrow_array::{RecordBatch, RecordBatchReader, UInt32Array};
 use arrow_schema::Schema as ArrowSchema;
 use bytes::Bytes;
 use futures::stream::StreamExt;
-use lance::index::vector::PartitionArtifactBuilder as CorePartitionArtifactBuilder;
 use lance::io::{ObjectStore, RecordBatchStream};
 use lance_core::cache::LanceCache;
 use lance_core::utils::path::LancePathExt;
@@ -368,82 +367,6 @@ impl Drop for LanceFileWriter {
             let mut inner = self.inner.lock().await;
             inner.abort().await;
         });
-    }
-}
-
-#[pyclass]
-pub struct PartitionArtifactBuilder {
-    inner: Arc<Mutex<CorePartitionArtifactBuilder>>,
-}
-
-impl PartitionArtifactBuilder {
-    #[allow(clippy::too_many_arguments)]
-    async fn open(
-        uri_or_path: String,
-        num_partitions: usize,
-        pq_code_width: usize,
-        storage_options: Option<HashMap<String, String>>,
-        storage_options_provider: Option<Arc<dyn lance_io::object_store::StorageOptionsProvider>>,
-    ) -> PyResult<Self> {
-        let (object_store, path) = object_store_from_uri_or_path_with_provider(
-            uri_or_path,
-            storage_options,
-            storage_options_provider,
-        )
-        .await?;
-        let inner = CorePartitionArtifactBuilder::try_new_with_store(
-            object_store,
-            path,
-            num_partitions,
-            pq_code_width,
-        )
-        .infer_error()?;
-        Ok(Self {
-            inner: Arc::new(Mutex::new(inner)),
-        })
-    }
-}
-
-#[pymethods]
-impl PartitionArtifactBuilder {
-    #[new]
-    #[pyo3(signature=(uri_or_path, num_partitions, pq_code_width, storage_options=None, storage_options_provider=None))]
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        uri_or_path: String,
-        num_partitions: usize,
-        pq_code_width: usize,
-        storage_options: Option<HashMap<String, String>>,
-        storage_options_provider: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<Self> {
-        let provider = storage_options_provider
-            .map(crate::storage_options::py_object_to_storage_options_provider)
-            .transpose()?;
-        rt().block_on(
-            None,
-            Self::open(
-                uri_or_path,
-                num_partitions,
-                pq_code_width,
-                storage_options,
-                provider,
-            ),
-        )?
-    }
-
-    pub fn append_batch(&self, batch: PyArrowType<RecordBatch>) -> PyResult<()> {
-        rt().runtime.block_on(async {
-            self.inner.lock().await.append_batch(&batch.0).await
-        })
-        .infer_error()
-    }
-
-    #[pyo3(signature=(metadata_file, total_loss=None))]
-    pub fn finish(&self, metadata_file: String, total_loss: Option<f64>) -> PyResult<Vec<String>> {
-        rt().runtime.block_on(async {
-            self.inner.lock().await.finish(&metadata_file, total_loss).await
-        })
-        .infer_error()
     }
 }
 

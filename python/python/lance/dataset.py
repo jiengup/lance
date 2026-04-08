@@ -39,7 +39,6 @@ from pyarrow import RecordBatch, Schema
 from lance.log import LOGGER
 
 from .blob import BlobFile
-from .cuvs import is_cuvs_accelerator
 from .dependencies import (
     _check_for_numpy,
     _check_for_torch,
@@ -2900,24 +2899,27 @@ class LanceDataset(pa.dataset.Dataset):
 
         # Handle timing for various parts of accelerated builds
         timers = {}
-        use_cuvs = is_cuvs_accelerator(accelerator)
+        if isinstance(accelerator, str) and accelerator.lower().startswith("cuvs"):
+            raise ValueError(
+                "accelerator='cuvs' is not built into Lance. "
+                "Use the external 'lance-cuvs' package to produce a "
+                "precomputed partition artifact and then call create_index "
+                "with precomputed_partition_artifact_uri."
+            )
         if accelerator is not None and index_type != "IVF_PQ":
-            if use_cuvs:
-                raise ValueError(
-                    f"accelerator='{accelerator}' only supports IVF_PQ index builds"
-                )
             LOGGER.warning(
                 "Index type %s does not support GPU acceleration; falling back to CPU",
                 index_type,
             )
             accelerator = None
-            use_cuvs = False
 
         # IMPORTANT: Distributed indexing is CPU-only. Enforce single-node when
-        # any Python-side accelerator path is selected.
-        accelerated_build_detected = accelerator is not None
+        # accelerator or torch-related paths are detected.
+        torch_detected = False
         try:
-            if accelerator is None:
+            if accelerator is not None:
+                torch_detected = True
+            else:
                 impl = kwargs.get("implementation")
                 use_torch_flag = kwargs.get("use_torch") is True
                 one_pass_flag = kwargs.get("one_pass_ivfpq") is True
@@ -2930,16 +2932,16 @@ class LanceDataset(pa.dataset.Dataset):
                     or torch_centroids
                     or torch_codebook
                 ):
-                    accelerated_build_detected = True
+                    torch_detected = True
         except Exception:
             # Be conservative: if detection fails, do not modify behavior
             pass
 
-        if accelerated_build_detected:
+        if torch_detected:
             if require_commit:
                 if fragment_ids is not None or index_uuid is not None:
                     LOGGER.info(
-                        "Accelerated build detected; "
+                        "Torch detected; "
                         "enforce single-node indexing (distributed is CPU-only)."
                     )
                 fragment_ids = None
@@ -2947,7 +2949,7 @@ class LanceDataset(pa.dataset.Dataset):
             else:
                 if index_uuid is not None:
                     LOGGER.info(
-                        "Accelerated build detected; "
+                        "Torch detected; "
                         "enforce single-node indexing (distributed is CPU-only)."
                     )
                 index_uuid = None
@@ -2958,83 +2960,52 @@ class LanceDataset(pa.dataset.Dataset):
                 num_partitions = _target_partition_size_to_num_partitions(
                     num_rows, target_partition_size
                 )
+            from .vector import (
+                one_pass_assign_ivf_pq_on_accelerator,
+                one_pass_train_ivf_pq_on_accelerator,
+            )
 
-            if use_cuvs:
-                from .cuvs import build_vector_index_on_cuvs
+            LOGGER.info("Doing one-pass ivfpq accelerated computations")
+            timers["ivf+pq_train:start"] = time.time()
+            (
+                ivf_centroids,
+                ivf_kmeans,
+                pq_codebook,
+                pq_kmeans_list,
+            ) = one_pass_train_ivf_pq_on_accelerator(
+                self,
+                column[0],
+                num_partitions,
+                metric,
+                accelerator,
+                num_sub_vectors=num_sub_vectors,
+                batch_size=20480,
+                filter_nan=filter_nan,
+            )
+            timers["ivf+pq_train:end"] = time.time()
+            ivfpq_train_time = timers["ivf+pq_train:end"] - timers["ivf+pq_train:start"]
+            LOGGER.info("ivf+pq training time: %ss", ivfpq_train_time)
+            timers["ivf+pq_assign:start"] = time.time()
+            shuffle_output_dir, shuffle_buffers = one_pass_assign_ivf_pq_on_accelerator(
+                self,
+                column[0],
+                metric,
+                accelerator,
+                ivf_kmeans,
+                pq_kmeans_list,
+                batch_size=20480,
+                filter_nan=filter_nan,
+            )
+            timers["ivf+pq_assign:end"] = time.time()
+            ivfpq_assign_time = (
+                timers["ivf+pq_assign:end"] - timers["ivf+pq_assign:start"]
+            )
+            LOGGER.info("ivf+pq transform time: %ss", ivfpq_assign_time)
 
-                LOGGER.info("Doing cuVS vector backend build")
-                timers["ivf+pq_build:start"] = time.time()
-                artifact_root, _, ivf_centroids, pq_codebook = build_vector_index_on_cuvs(
-                    self,
-                    column[0],
-                    metric,
-                    accelerator,
-                    num_partitions,
-                    num_sub_vectors,
-                    sample_rate=kwargs.get("sample_rate", 256),
-                    max_iters=kwargs.get("max_iters", 50),
-                    num_bits=kwargs.get("num_bits", 8),
-                    batch_size=1024 * 128,
-                    filter_nan=filter_nan,
-                )
-                kwargs["precomputed_partition_artifact_uri"] = artifact_root
-                timers["ivf+pq_build:end"] = time.time()
-                ivfpq_build_time = (
-                    timers["ivf+pq_build:end"] - timers["ivf+pq_build:start"]
-                )
-                LOGGER.info("cuVS ivf+pq build time: %ss", ivfpq_build_time)
-            else:
-                from .vector import (
-                    one_pass_assign_ivf_pq_on_accelerator,
-                    one_pass_train_ivf_pq_on_accelerator,
-                )
-
-                LOGGER.info("Doing one-pass ivfpq accelerated computations")
-                timers["ivf+pq_train:start"] = time.time()
-                (
-                    ivf_centroids,
-                    ivf_kmeans,
-                    pq_codebook,
-                    pq_kmeans_list,
-                ) = one_pass_train_ivf_pq_on_accelerator(
-                    self,
-                    column[0],
-                    num_partitions,
-                    metric,
-                    accelerator,
-                    num_sub_vectors=num_sub_vectors,
-                    batch_size=20480,
-                    filter_nan=filter_nan,
-                )
-                timers["ivf+pq_train:end"] = time.time()
-                ivfpq_train_time = (
-                    timers["ivf+pq_train:end"] - timers["ivf+pq_train:start"]
-                )
-                LOGGER.info("ivf+pq training time: %ss", ivfpq_train_time)
-                timers["ivf+pq_assign:start"] = time.time()
-                (
-                    shuffle_output_dir,
-                    shuffle_buffers,
-                ) = one_pass_assign_ivf_pq_on_accelerator(
-                    self,
-                    column[0],
-                    metric,
-                    accelerator,
-                    ivf_kmeans,
-                    pq_kmeans_list,
-                    batch_size=20480,
-                    filter_nan=filter_nan,
-                )
-                timers["ivf+pq_assign:end"] = time.time()
-                ivfpq_assign_time = (
-                    timers["ivf+pq_assign:end"] - timers["ivf+pq_assign:start"]
-                )
-                LOGGER.info("ivf+pq transform time: %ss", ivfpq_assign_time)
-
-                kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
-                kwargs["precomputed_shuffle_buffers_path"] = os.path.join(
-                    shuffle_output_dir, "data"
-                )
+            kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
+            kwargs["precomputed_shuffle_buffers_path"] = os.path.join(
+                shuffle_output_dir, "data"
+            )
         if index_type.startswith("IVF"):
             if (ivf_centroids is not None) and (ivf_centroids_file is not None):
                 raise ValueError(
@@ -3190,13 +3161,6 @@ class LanceDataset(pa.dataset.Dataset):
                 "Temporary shuffle buffers stored at %s, you may want to delete it.",
                 kwargs["precomputed_shuffle_buffers_path"],
             )
-        if "precomputed_encoded_dataset_uri" in kwargs.keys() and os.path.exists(
-            kwargs["precomputed_encoded_dataset_uri"]
-        ):
-            LOGGER.info(
-                "Temporary precomputed encoded dataset stored at %s, you may want to delete it.",
-                kwargs["precomputed_encoded_dataset_uri"],
-            )
         if "precomputed_partition_artifact_uri" in kwargs.keys() and os.path.exists(
             kwargs["precomputed_partition_artifact_uri"]
         ):
@@ -3279,17 +3243,7 @@ class LanceDataset(pa.dataset.Dataset):
             The number of sub-vectors for PQ (Product Quantization).
         accelerator : str or ``torch.Device``, optional
             If set, use an accelerator to speed up the training process.
-            Accepted accelerator:
-
-            - "cuda" or ``torch.device(...)`` for the existing torch-based path
-              on NVIDIA GPUs
-            - "mps" for Apple Silicon GPU
-            - "cuvs" for the explicit cuVS-based IVF_PQ training path on NVIDIA
-              GPUs
-
-            The cuVS path also requires the cuVS Python bindings to be installed
-            separately.
-
+            Accepted accelerator: "cuda" (Nvidia GPU) and "mps" (Apple Silicon GPU).
             If not set, use the CPU.
         index_cache_size : int, optional
             The size of the index cache in number of entries. Default value is 256.
@@ -3355,6 +3309,11 @@ class LanceDataset(pa.dataset.Dataset):
                 Only 4, 8 are supported.
             - index_file_version
                 The version of the index file. Default is "V3".
+            - precomputed_partition_artifact_uri
+                An advanced input produced by an external backend such as
+                `lance-cuvs`. When set, Lance skips its own partition assignment
+                and consumes the precomputed partition-local artifact during
+                finalization. Requires `ivf_centroids` and `pq_codebook`.
 
         Optional parameters for `IVF_RQ`:
 
@@ -3398,13 +3357,8 @@ class LanceDataset(pa.dataset.Dataset):
         Experimental Accelerator (GPU) support:
 
         - *accelerate*: use GPU to train IVF partitions.
-            `accelerator="cuda"` and `accelerator="mps"` use the existing torch
-            path. `accelerator="cuda"` runs on NVIDIA GPUs and `accelerator="mps"`
-            runs on Apple Silicon GPUs. `accelerator="cuvs"` uses cuVS for IVF_PQ
-            training only and requires an NVIDIA GPU.
-
-            The torch path requires PyTorch. The cuVS path requires the cuVS
-            Python bindings to be installed separately.
+            Only supports CUDA (Nvidia) or MPS (Apple) currently.
+            Requires PyTorch being installed.
 
         .. code-block:: python
 
@@ -3419,10 +3373,9 @@ class LanceDataset(pa.dataset.Dataset):
                 accelerator="cuda"
             )
 
-        Note: accelerator support is currently limited to the ``IVF_PQ`` index type.
-        Providing ``accelerator="cuda"`` for other index types will fall back to CPU
-        index building. Providing ``accelerator="cuvs"`` for other index types will
-        raise an error.
+        Note: GPU acceleration is currently supported only for the ``IVF_PQ`` index
+        type. Providing an accelerator for other index types will fall back to CPU
+        index building.
 
         References
         ----------

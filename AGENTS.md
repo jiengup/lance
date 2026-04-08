@@ -53,12 +53,6 @@ cd test_data && docker compose up -d
 AWS_DEFAULT_REGION=us-east-1 pytest --run-integration python/tests/test_s3_ddb.py
 ```
 
-### Benchmarking Discipline
-
-- Benchmark machines must use release builds only. For Python bindings, always run `maturin develop --release` before collecting any timing data.
-- Never use `maturin develop` without `--release` on a benchmark host. If a dev-profile rebuild is needed for functional debugging, use a different machine or clearly discard all performance results collected afterwards.
-- Before trusting a benchmark result, verify the mounted benchmark volume and the active build profile.
-
 ## Coding Standards
 
 ### General

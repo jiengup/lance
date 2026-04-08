@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import logging
-import json
 import os
 import platform
 import random
@@ -10,27 +9,19 @@ import shutil
 import string
 import tempfile
 import time
-from importlib import import_module
-from pathlib import Path
 from typing import Optional
 
 import lance
-import lance.cuvs as lance_cuvs
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
 from lance import LanceDataset, LanceFragment
 from lance.dataset import VectorIndexReader
-from lance.file import LanceFileReader
 from lance.indices import IndexFileVersion, IndicesBuilder
 from lance.query import MatchQuery, PhraseQuery
 from lance.util import validate_vector_index  # noqa: E402
 from lance.vector import vec_to_table  # noqa: E402
-
-
-def _disable_rust_cuvs_backend(monkeypatch):
-    del monkeypatch
 
 
 def create_table(nvec=1000, ndim=128, nans=0, nullify=False, dtype=np.float32):
@@ -543,357 +534,46 @@ def test_create_index_accelerator_fallback(tmp_path, caplog):
     )
 
 
-def test_create_index_cuvs_dispatch(tmp_path, monkeypatch):
-    tbl = create_table(nvec=512, ndim=128)
-    dataset = lance.write_dataset(tbl, tmp_path)
-    calls = {}
-
-    def fake_build(
-        dataset_arg,
-        column,
-        metric_type,
-        accelerator,
-        num_partitions,
-        num_sub_vectors,
-        **kwargs,
-    ):
-        calls["dataset"] = dataset_arg
-        calls["column"] = column
-        calls["num_partitions"] = num_partitions
-        calls["metric_type"] = metric_type
-        calls["accelerator"] = accelerator
-        calls["num_sub_vectors"] = num_sub_vectors
-        calls["kwargs"] = kwargs
-        return str(tmp_path / "cuvs_artifact"), [
-            "manifest.json",
-            "metadata.lance",
-            "partitions/bucket-00000.lance",
-        ], np.random.randn(num_partitions, 128).astype(np.float32), np.random.randn(
-            num_sub_vectors, 256, 128 // num_sub_vectors
-        ).astype(np.float32)
-
-    monkeypatch.setattr(lance_cuvs, "build_vector_index_on_cuvs", fake_build)
-
-    dataset = dataset.create_index(
-        "vector",
-        index_type="IVF_PQ",
-        num_partitions=4,
-        num_sub_vectors=16,
-        accelerator="cuvs",
-    )
-
-    assert calls["column"] == "vector"
-    assert calls["num_partitions"] == 4
-    assert calls["metric_type"] == "L2"
-    assert calls["accelerator"] == "cuvs"
-    assert calls["num_sub_vectors"] == 16
-    assert calls["kwargs"]["sample_rate"] == 256
-    assert calls["kwargs"]["max_iters"] == 50
-    assert calls["kwargs"]["num_bits"] == 8
-    assert calls["kwargs"]["batch_size"] == 1024 * 128
-    assert calls["kwargs"]["filter_nan"] is True
-    assert dataset.stats.index_stats("vector_idx")["index_type"] == "IVF_PQ"
-
-
-def test_create_index_cuvs_rejects_non_ivf_pq(tmp_path):
+def test_create_index_rejects_cuvs_accelerator(tmp_path):
     tbl = create_table()
     dataset = lance.write_dataset(tbl, tmp_path)
 
-    with pytest.raises(ValueError, match="only supports IVF_PQ"):
+    with pytest.raises(ValueError, match="not built into Lance"):
         dataset.create_index(
             "vector",
-            index_type="IVF_FLAT",
+            index_type="IVF_PQ",
             num_partitions=4,
+            num_sub_vectors=16,
             accelerator="cuvs",
         )
 
 
-def test_prepare_global_ivf_pq_cuvs_dispatch(tmp_path, monkeypatch):
-    ds = _make_sample_dataset_base(tmp_path, "cuvs_prepare_ds", 512, 128)
+def test_prepare_global_ivf_pq_rejects_cuvs_accelerator(tmp_path):
+    ds = _make_sample_dataset_base(tmp_path, "prepare_ivf_pq_cuvs_ds", 512, 128)
     builder = IndicesBuilder(ds, "vector")
-    builder_module = import_module("lance.indices.builder")
-    calls = {}
-
-    def fake_prepare(
-        dataset_arg,
-        column,
-        num_partitions,
-        num_sub_vectors,
-        *,
-        distance_type,
-        accelerator,
-        sample_rate,
-        max_iters,
-    ):
-        calls["dataset"] = dataset_arg
-        calls["column"] = column
-        calls["num_partitions"] = num_partitions
-        calls["num_sub_vectors"] = num_sub_vectors
-        calls["distance_type"] = distance_type
-        calls["accelerator"] = accelerator
-        calls["sample_rate"] = sample_rate
-        calls["max_iters"] = max_iters
-        return {
-            "ivf_centroids": np.random.randn(num_partitions, 128).astype(np.float32),
-            "pq_codebook": np.random.randn(
-                num_sub_vectors, 256, 128 // num_sub_vectors
-            ).astype(np.float32),
-        }
-
-    monkeypatch.setattr(builder_module, "prepare_global_ivf_pq_on_cuvs", fake_prepare)
-
-    prepared = builder.prepare_global_ivf_pq(
-        num_partitions=4,
-        num_subvectors=16,
-        distance_type="l2",
-        accelerator="cuvs",
-        sample_rate=7,
-        max_iters=20,
-    )
-
-    assert calls["column"] == "vector"
-    assert calls["num_partitions"] == 4
-    assert calls["num_sub_vectors"] == 16
-    assert calls["distance_type"] == "l2"
-    assert calls["accelerator"] == "cuvs"
-    assert prepared["ivf_centroids"].shape == (4, 128)
-    assert prepared["pq_codebook"].shape == (16, 256, 8)
-
-
-def test_train_ivf_pq_on_cuvs_nullable_vectors(tmp_path, monkeypatch):
-    _disable_rust_cuvs_backend(monkeypatch)
-    tbl = create_table(nvec=32, ndim=16, nullify=True)
-    dataset = lance.write_dataset(tbl, tmp_path)
-
-    class FakeIndex:
-        centers = np.random.randn(4, 16).astype(np.float32)
-        pq_centers = np.random.randn(4, 256, 4).astype(np.float32)
-
-    class FakeIvfPqModule:
-        class IndexParams:
-            def __init__(self, **kwargs):
-                self.kwargs = kwargs
-
-        @staticmethod
-        def build(build_params, matrix):
-            assert build_params.kwargs["n_lists"] == 4
-            assert matrix.shape[1] == 16
-            assert matrix.dtype == np.float32
-            return FakeIndex()
-
-    monkeypatch.setattr(lance_cuvs, "_require_cuvs", lambda: FakeIvfPqModule())
-
-    centroids, pq_codebook = lance_cuvs.train_ivf_pq_on_cuvs(
-        dataset,
-        "vector",
-        4,
-        "L2",
-        "cuvs",
-        4,
-        sample_rate=4,
-    )
-
-    assert centroids.shape == (4, 16)
-    assert pq_codebook.shape == (4, 256, 4)
-
-
-def test_train_ivf_pq_on_cuvs_uses_num_sub_vectors_for_pq_dim(
-    tmp_path, monkeypatch
-):
-    _disable_rust_cuvs_backend(monkeypatch)
-    dataset = lance.write_dataset(create_table(nvec=32, ndim=16), tmp_path)
-    calls = {}
-
-    class FakeIndex:
-        centers = np.random.randn(4, 16).astype(np.float32)
-        pq_centers = np.random.randn(2, 256, 8).astype(np.float32)
-
-    class FakeIvfPqModule:
-        class IndexParams:
-            def __init__(self, **kwargs):
-                calls.update(kwargs)
-
-        @staticmethod
-        def build(build_params, matrix):
-            assert matrix.shape[1] == 16
-            return FakeIndex()
-
-    monkeypatch.setattr(lance_cuvs, "_require_cuvs", lambda: FakeIvfPqModule())
-
-    centroids, pq_codebook = lance_cuvs.train_ivf_pq_on_cuvs(
-        dataset,
-        "vector",
-        4,
-        "l2",
-        "cuvs",
-        2,
-        sample_rate=4,
-    )
-
-    assert calls["pq_dim"] == 2
-    assert centroids.shape == (4, 16)
-    assert pq_codebook.shape == (2, 256, 8)
-
-
-def test_normalize_pq_codebook_accepts_subvector_dim_first_layout():
-    class FakeIndex:
-        pq_centers = np.random.randn(8, 16, 256).astype(np.float32)
-
-    pq_codebook = lance_cuvs._normalize_pq_codebook(
-        FakeIndex(), num_sub_vectors=16, num_bits=8, dimension=128
-    )
-
-    assert pq_codebook.shape == (16, 256, 8)
-
-
-def test_cuvs_as_numpy_prefers_copy_to_host():
-    class FakeDeviceTensor:
-        def copy_to_host(self):
-            return np.arange(6, dtype=np.float32).reshape(2, 3)
-
-    array = lance_cuvs._as_numpy(FakeDeviceTensor())
-
-    assert isinstance(array, np.ndarray)
-    assert array.shape == (2, 3)
-    assert array.dtype == np.float32
-
-
-def test_annotate_precomputed_encoded_dataset_scans_fragment_directly(tmp_path):
-    dataset_uri = tmp_path / "encoded_dataset"
-
-    def make_table(partition_ids: list[int], row_id_start: int):
-        part_ids = np.asarray(partition_ids, dtype=np.uint32)
-        row_ids = pa.array(
-            np.arange(row_id_start, row_id_start + len(partition_ids), dtype=np.uint64)
-        )
-        pq_values = pa.array(np.zeros(len(partition_ids) * 4, dtype=np.uint8))
-        pq_codes = pa.FixedSizeListArray.from_arrays(pq_values, 4)
-        return pa.Table.from_arrays(
-            [row_ids, pa.array(part_ids), pq_codes],
-            names=["row_id", "__ivf_part_id", "__pq_code"],
+    with pytest.raises(ValueError, match="not built into Lance"):
+        builder.prepare_global_ivf_pq(
+            num_partitions=4,
+            num_subvectors=16,
+            distance_type="l2",
+            accelerator="cuvs",
+            sample_rate=7,
+            max_iters=20,
         )
 
-    ds = lance.write_dataset(make_table([0, 1, 1, 0], 0), dataset_uri)
-    ds = lance.write_dataset(make_table([2, 3, 2, 3], 4), dataset_uri, mode="append")
 
-    lance_cuvs._annotate_precomputed_encoded_dataset(ds, [2, 2, 2, 2])
+def test_create_index_rejects_missing_precomputed_partition_artifact(tmp_path):
+    dataset = lance.write_dataset(create_table(nvec=64, ndim=128), tmp_path / "artifact_src")
 
-    metadata = ds.metadata()
-    partition_fragments = json.loads(
-        metadata[
-            lance_cuvs.PRECOMPUTED_ENCODED_PARTITION_FRAGMENT_IDS_METADATA_KEY
-        ]
-    )
-    assert partition_fragments == [[0], [0], [1], [1]]
-
-
-def test_one_pass_assign_ivf_pq_on_cuvs_writes_partition_artifact(tmp_path, monkeypatch):
-    _disable_rust_cuvs_backend(monkeypatch)
-    tbl = create_table(nvec=32, ndim=16)
-    dataset = lance.write_dataset(tbl, tmp_path / "cuvs_assign_src")
-
-    ivf_centroids = np.random.randn(4, 16).astype(np.float32)
-    pq_codebook = np.random.randn(4, 256, 4).astype(np.float32)
-
-    class FakeDeviceTensor:
-        def __init__(self, array):
-            self._array = array
-
-        def copy_to_host(self):
-            return self._array
-
-    class FakeCupyArray:
-        def __init__(self, array):
-            self.array = array
-
-    class FakeCupyModule:
-        @staticmethod
-        def asarray(array):
-            return FakeCupyArray(array)
-
-    class FakeIndex:
-        pq_dim = 4
-        pq_bits = 8
-
-    class FakeIvfPqModule:
-        @staticmethod
-        def transform(index, vectors):
-            assert isinstance(index, FakeIndex)
-            assert isinstance(vectors, FakeCupyArray)
-            labels = np.arange(len(vectors.array), dtype=np.uint32) % 4
-            pq_codes = np.full((len(vectors.array), 4), 7, dtype=np.uint8)
-            return FakeDeviceTensor(labels), FakeDeviceTensor(pq_codes)
-
-    monkeypatch.setattr(lance_cuvs, "_require_cuvs", lambda: FakeIvfPqModule())
-    monkeypatch.setattr(lance_cuvs, "_optional_cupy", lambda: FakeCupyModule())
-
-    artifact_root, artifact_files = lance_cuvs.one_pass_assign_ivf_pq_on_cuvs(
-        dataset,
-        "vector",
-        "l2",
-        "cuvs",
-        ivf_centroids,
-        pq_codebook,
-        trained_index=FakeIndex(),
-        batch_size=8,
-    )
-
-    manifest_path = Path(artifact_root) / lance_cuvs.PARTITION_ARTIFACT_MANIFEST_FILE_NAME
-    metadata_path = Path(artifact_root) / lance_cuvs.PARTITION_ARTIFACT_METADATA_FILE_NAME
-
-    assert manifest_path.exists()
-    assert metadata_path.exists()
-    assert any(path.endswith(".lance") for path in artifact_files)
-
-    manifest = json.loads(manifest_path.read_text())
-    assert manifest["version"] == lance_cuvs.PARTITION_ARTIFACT_MANIFEST_VERSION
-    assert manifest["num_partitions"] == 4
-    assert manifest["metadata_file"] == lance_cuvs.PARTITION_ARTIFACT_METADATA_FILE_NAME
-    assert [entry["num_rows"] for entry in manifest["partitions"]] == [8, 8, 8, 8]
-    assert all(entry["path"] for entry in manifest["partitions"])
-    assert all(entry["ranges"] for entry in manifest["partitions"])
-
-    metadata_reader = LanceFileReader(str(metadata_path))
-    metadata_table = metadata_reader.read_all().to_table()
-    assert metadata_table.column("_ivf_centroids").type == pa.list_(pa.list_(pa.float32(), 16))
-    assert metadata_table.column("_pq_codebook").type == pa.list_(pa.list_(pa.float32(), 4))
-
-    bucket_path = Path(artifact_root) / manifest["partitions"][0]["path"]
-    bucket_reader = LanceFileReader(str(bucket_path))
-    bucket_table = bucket_reader.read_all().to_table()
-    assert bucket_table.column("_rowid").type == pa.uint64()
-    assert bucket_table.column("__pq_code").type == pa.list_(pa.uint8(), 4)
-
-
-def test_one_pass_assign_ivf_pq_on_cuvs_rejects_incompatible_transform_width(
-    tmp_path,
-    monkeypatch,
-):
-    _disable_rust_cuvs_backend(monkeypatch)
-    tbl = create_table(nvec=32, ndim=128)
-    dataset = lance.write_dataset(tbl, tmp_path / "cuvs_assign_incompatible")
-
-    ivf_centroids = np.random.randn(4, 128).astype(np.float32)
-    pq_codebook = np.random.randn(16, 256, 8).astype(np.float32)
-    monkeypatch.setattr(lance_cuvs, "_require_cuvs", lambda: object())
-
-    class FakeIndex:
-        pq_dim = 8
-        pq_bits = 8
-
-    with pytest.raises(
-        ValueError,
-        match="cuVS transform output is incompatible with Lance IVF_PQ",
-    ):
-        lance_cuvs.one_pass_assign_ivf_pq_on_cuvs(
-            dataset,
+    with pytest.raises(Exception):
+        dataset.create_index(
             "vector",
-            "l2",
-            "cuvs",
-            ivf_centroids,
-            pq_codebook,
-            trained_index=FakeIndex(),
-            batch_size=8,
+            index_type="IVF_PQ",
+            num_partitions=4,
+            num_sub_vectors=16,
+            ivf_centroids=np.random.randn(4, 128).astype(np.float32),
+            pq_codebook=np.random.randn(16, 256, 8).astype(np.float32),
+            precomputed_partition_artifact_uri=str(tmp_path / "missing_artifact"),
         )
 
 

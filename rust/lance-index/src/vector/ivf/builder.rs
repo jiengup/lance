@@ -48,11 +48,6 @@ pub struct IvfBuildParams {
     /// The input is expected to be (/dir/to/buffers, [buffer1.lance, buffer2.lance, ...])
     pub precomputed_shuffle_buffers: Option<(String, Vec<String>)>,
 
-    /// Precomputed encoded dataset (_rowid/row_id -> partition_id, pq_code).
-    /// Mutually exclusive with `precomputed_partitions_file` and `precomputed_shuffle_buffers`.
-    /// Requires `centroids` to be set.
-    pub precomputed_encoded_dataset_uri: Option<String>,
-
     /// Precomputed partitioned artifact produced by an external backend.
     /// Mutually exclusive with other precomputed inputs and requires `centroids` to be set.
     pub precomputed_partition_artifact_uri: Option<String>,
@@ -76,7 +71,6 @@ impl Default for IvfBuildParams {
             sample_rate: 256, // See faiss
             precomputed_partitions_file: None,
             precomputed_shuffle_buffers: None,
-            precomputed_encoded_dataset_uri: None,
             precomputed_partition_artifact_uri: None,
             shuffle_partition_batches: 1024 * 10,
             shuffle_partition_concurrency: 2,
