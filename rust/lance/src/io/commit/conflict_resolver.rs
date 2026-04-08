@@ -1116,6 +1116,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Rewrite { .. }
             | Operation::Clone { .. }
             | Operation::ReserveFragments { .. }
+            | Operation::ReserveRowIds { .. }
             | Operation::UpdateBases { .. } => Ok(()),
             Operation::Merge { .. } | Operation::Project { .. } => {
                 // Need to recompute the schema
