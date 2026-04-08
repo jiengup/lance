@@ -306,6 +306,7 @@ impl Manifest {
             // Reservations stay on the source version line; the clone only keeps
             // the next row-id counter.
             next_row_id: self.next_row_id,
+            reserved_row_ids: Vec::new(),
             data_storage_format: self.data_storage_format.clone(),
             config: self.config.clone(),
             base_paths: {
