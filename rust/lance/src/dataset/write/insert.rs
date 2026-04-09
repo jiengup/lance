@@ -82,13 +82,15 @@ impl<'a> InsertBuilder<'a> {
     /// Use a pre-reserved range of stable row ids for the appended rows.
     ///
     /// The provided range must come from the `ReserveRowIds` transaction at the
-    /// append transaction's `read_version`. Any unused remainder is discarded
-    /// once the append commits.
+    /// append transaction's `read_version`.
     ///
     /// If `row_ids.num_rows` is larger than the number of rows actually
-    /// appended then only the prefix is assigned to written rows. The unused
-    /// tail is permanently discarded, and concurrent conflict checks still use
-    /// the full provided range.
+    /// appended then only the prefix is assigned to written rows.
+    ///
+    /// Multiple append transactions may consume disjoint sub-ranges from the
+    /// same reservation, as long as each append still uses the reserve
+    /// transaction's version as its `read_version` and the requested ranges do
+    /// not overlap with each other.
     pub fn with_row_ids(mut self, row_ids: ReservedRowIds) -> Self {
         self.row_ids = Some(row_ids);
         self

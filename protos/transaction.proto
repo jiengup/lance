@@ -42,7 +42,9 @@ message Transaction {
     // Stable row ids to assign to the new rows, if pre-reserved.
     //
     // The requested range must be contained within the row ids reserved by the
-    // dataset version identified by read_version.
+    // dataset version identified by read_version. Multiple append operations
+    // may consume disjoint sub-ranges from the same reservation as long as
+    // they continue to reference that reserve version.
     ReservedRowIds row_ids = 2;
   }
 
