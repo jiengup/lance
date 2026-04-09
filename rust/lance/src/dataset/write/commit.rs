@@ -66,7 +66,7 @@ impl<'a> CommitBuilder<'a> {
         };
 
         let base_dataset = if dataset.manifest.version == transaction.read_version {
-            dataset.as_ref().clone()
+            dataset.clone()
         } else {
             dataset.checkout_version(transaction.read_version).await?
         };
