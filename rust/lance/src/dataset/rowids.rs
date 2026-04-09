@@ -340,7 +340,7 @@ mod test {
 
         let reserve_txn = TransactionBuilder::new(
             dataset.manifest().version,
-            Operation::ReserveRowIds { num_rows: 6 },
+            Operation::ReserveRowIds { num_rows: 7 },
         )
         .build();
         let dataset = CommitBuilder::new(Arc::new(dataset))
