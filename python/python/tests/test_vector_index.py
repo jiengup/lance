@@ -682,6 +682,7 @@ def test_build_vector_index_on_cuvs_delegates_to_external_backend(tmp_path, monk
             4,
             16,
             dst_dataset_uri=tmp_path / "artifact_root",
+            storage_options={"region": "us-east-1"},
             sample_rate=7,
             max_iters=20,
             num_bits=4,
@@ -700,6 +701,7 @@ def test_build_vector_index_on_cuvs_delegates_to_external_backend(tmp_path, monk
         "max_iters": 20,
         "num_bits": 4,
         "filter_nan": False,
+        "storage_options": {"region": "us-east-1"},
     }
     assert calls["build"]["dataset_uri"] == ds.uri
     assert calls["build"]["column"] == "vector"
@@ -707,6 +709,7 @@ def test_build_vector_index_on_cuvs_delegates_to_external_backend(tmp_path, monk
     assert calls["build"]["artifact_uri"] == str(tmp_path / "artifact_root")
     assert calls["build"]["batch_size"] == 4096
     assert calls["build"]["filter_nan"] is False
+    assert calls["build"]["storage_options"] == {"region": "us-east-1"}
     assert artifact_uri == str(tmp_path / "artifact")
     assert files == [str(tmp_path / "artifact" / "data.lance")]
     assert ivf_centroids.equals(training.ivf_centroids())

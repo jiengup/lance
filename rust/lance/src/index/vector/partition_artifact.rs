@@ -7,9 +7,8 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use arrow_array::cast::AsArray;
-use arrow_array::{FixedSizeListArray, RecordBatch, UInt8Array, UInt32Array, UInt64Array};
+use arrow_array::{FixedSizeListArray, RecordBatch, UInt8Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-use futures::TryStreamExt;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::Schema;
@@ -34,7 +33,6 @@ const PARTITION_ARTIFACT_MANIFEST_VERSION: u32 = 1;
 const PARTITION_ARTIFACT_MANIFEST_FILE_NAME: &str = "manifest.json";
 const PARTITION_ARTIFACT_PARTITIONS_DIR: &str = "partitions";
 const PARTITION_ARTIFACT_DEFAULT_BUCKETS: usize = 256;
-const PARTITION_ARTIFACT_STAGING_PREFIX: &str = ".staging-bucket-";
 const PARTITION_ARTIFACT_BUCKET_PREFIX: &str = "bucket-";
 const PARTITION_ARTIFACT_FILE_VERSION: &str = "2.2";
 const PARTITION_ARTIFACT_BUCKET_BUFFER_ROWS: usize = 32 * 1024;
@@ -107,23 +105,22 @@ impl BucketBuffer {
 
 /// Writes partition-addressable encoded rows for a later Lance finalization.
 ///
-/// The builder uses a two-phase layout:
-/// 1. Append arbitrary input batches into temporary bucket files.
-/// 2. Reopen each bucket, sort rows by partition id, and rewrite one finalized
-///    bucket file plus a compact manifest that records per-partition ranges.
-///
-/// This keeps the write path sequential and bounded in memory while still
-/// giving the finalizer efficient partition reads.
+/// The builder uses bucket-local buffering to keep append-time memory bounded.
+/// Each flush sorts only the current in-memory bucket and appends it directly to
+/// the finalized bucket file, while the manifest accumulates per-partition row
+/// ranges. This keeps the writer streaming and avoids a full read/sort/rewrite
+/// pass at `finish()` time.
 pub struct PartitionArtifactBuilder {
     object_store: Arc<ObjectStore>,
     root_dir: Path,
     num_partitions: usize,
     num_buckets: usize,
     pq_code_width: usize,
-    temp_schema: Arc<ArrowSchema>,
     final_schema: Arc<ArrowSchema>,
-    temp_writers: Vec<Option<FileWriter>>,
+    final_writers: Vec<Option<FileWriter>>,
     buffers: Vec<BucketBuffer>,
+    partitions: Vec<PartitionArtifactPartition>,
+    bucket_row_counts: Vec<u64>,
 }
 
 impl PartitionArtifactBuilder {
@@ -158,10 +155,10 @@ impl PartitionArtifactBuilder {
 
     /// Create a builder against an already-resolved object store.
     ///
-    /// The builder precomputes the temporary and final schemas and allocates
-    /// one staging buffer per bucket. Buckets are a write-time sharding scheme:
-    /// they are not visible to readers, but they keep memory usage bounded and
-    /// avoid one file per partition.
+    /// The builder precomputes the final schema and allocates one staging
+    /// buffer per bucket. Buckets are a write-time sharding scheme: they are
+    /// not visible to readers, but they keep memory usage bounded and avoid one
+    /// file per partition.
     pub fn try_new_with_store(
         object_store: Arc<ObjectStore>,
         root_dir: Path,
@@ -182,18 +179,6 @@ impl PartitionArtifactBuilder {
         let num_buckets = num_partitions
             .min(PARTITION_ARTIFACT_DEFAULT_BUCKETS)
             .max(1);
-        let temp_schema = Arc::new(ArrowSchema::new(vec![
-            Field::new(ROW_ID, DataType::UInt64, false),
-            Field::new(PART_ID_COLUMN, DataType::UInt32, false),
-            Field::new(
-                PQ_CODE_COLUMN,
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::UInt8, true)),
-                    pq_code_width as i32,
-                ),
-                true,
-            ),
-        ]));
         let final_schema = Arc::new(ArrowSchema::new(vec![
             Field::new(ROW_ID, DataType::UInt64, false),
             Field::new(
@@ -212,10 +197,18 @@ impl PartitionArtifactBuilder {
             num_partitions,
             num_buckets,
             pq_code_width,
-            temp_schema,
             final_schema,
-            temp_writers: (0..num_buckets).map(|_| None).collect(),
+            final_writers: (0..num_buckets).map(|_| None).collect(),
             buffers: (0..num_buckets).map(|_| BucketBuffer::default()).collect(),
+            partitions: vec![
+                PartitionArtifactPartition {
+                    path: None,
+                    num_rows: 0,
+                    ranges: Vec::new(),
+                };
+                num_partitions
+            ],
+            bucket_row_counts: vec![0; num_buckets],
         })
     }
 
@@ -259,9 +252,9 @@ impl PartitionArtifactBuilder {
 
     /// Finalize the artifact and return the relative files that were created.
     ///
-    /// Finalization flushes all remaining staging buffers, rewrites each bucket
-    /// into its final sorted form, and emits a manifest that lets Lance reopen
-    /// the artifact as a [`ShuffleReader`].
+    /// Finalization only needs to flush the remaining in-memory buffers and
+    /// persist the manifest because bucket files are already in their final
+    /// layout.
     pub async fn finish(
         &mut self,
         metadata_file: &str,
@@ -270,25 +263,16 @@ impl PartitionArtifactBuilder {
         for bucket_id in 0..self.num_buckets {
             self.flush_bucket(bucket_id).await?;
         }
-        for writer in self.temp_writers.iter_mut() {
+        for writer in self.final_writers.iter_mut() {
             if let Some(writer) = writer.as_mut() {
                 writer.finish().await?;
             }
         }
 
-        let mut partitions = vec![
-            PartitionArtifactPartition {
-                path: None,
-                num_rows: 0,
-                ranges: Vec::new(),
-            };
-            self.num_partitions
-        ];
         let mut artifact_files = Vec::with_capacity(self.num_buckets + 1);
-
         for bucket_id in 0..self.num_buckets {
-            if let Some(relative_path) = self.finalize_bucket(bucket_id, &mut partitions).await? {
-                artifact_files.push(relative_path);
+            if self.final_writers[bucket_id].is_some() {
+                artifact_files.push(self.final_bucket_relative_path(bucket_id));
             }
         }
 
@@ -297,7 +281,7 @@ impl PartitionArtifactBuilder {
             num_partitions: self.num_partitions,
             metadata_file: Some(metadata_file.to_string()),
             total_loss,
-            partitions,
+            partitions: self.partitions.clone(),
         };
         write_json(
             self.object_store.as_ref(),
@@ -311,153 +295,39 @@ impl PartitionArtifactBuilder {
         Ok(files)
     }
 
-    /// Flush the current in-memory buffer for one bucket into its temporary
-    /// file.
+    /// Flush the current in-memory buffer for one bucket into its finalized
+    /// bucket file.
     ///
-    /// Temporary files preserve the original row order inside the bucket. The
-    /// expensive partition sort is deferred to `finalize_bucket`, so append-time
-    /// stays cheap.
+    /// Each flush sorts only the buffered rows for this bucket and appends them
+    /// to the final file while recording new manifest ranges for the affected
+    /// partitions.
     async fn flush_bucket(&mut self, bucket_id: usize) -> Result<()> {
         if self.buffers[bucket_id].is_empty() {
             return Ok(());
         }
 
-        let batch = self.take_temp_batch(bucket_id)?;
-        let writer = self.ensure_temp_writer(bucket_id).await?;
-        writer.write_batch(&batch).await?;
-        Ok(())
-    }
-
-    /// Convert a bucket's staged vectors into a temporary batch and empty the
-    /// in-memory buffer.
-    fn take_temp_batch(&mut self, bucket_id: usize) -> Result<RecordBatch> {
         let buffer = &mut self.buffers[bucket_id];
         let row_ids = UInt64Array::from(mem::take(&mut buffer.row_ids));
-        let part_ids = UInt32Array::from(mem::take(&mut buffer.partition_ids));
+        let part_ids = mem::take(&mut buffer.partition_ids);
         let pq_values = UInt8Array::from(mem::take(&mut buffer.pq_values));
-        let pq_codes =
-            FixedSizeListArray::try_new_from_values(pq_values, self.pq_code_width as i32)?;
-        RecordBatch::try_new(
-            self.temp_schema.clone(),
-            vec![Arc::new(row_ids), Arc::new(part_ids), Arc::new(pq_codes)],
-        )
-        .map_err(Error::from)
-    }
-
-    /// Lazily create the temporary writer for a bucket.
-    ///
-    /// Buckets that never receive rows never create a file, which keeps sparse
-    /// artifacts compact.
-    async fn ensure_temp_writer(&mut self, bucket_id: usize) -> Result<&mut FileWriter> {
-        if self.temp_writers[bucket_id].is_none() {
-            let path = self.temp_bucket_path(bucket_id);
-            let writer = FileWriter::try_new(
-                self.object_store.create(&path).await?,
-                Schema::try_from(self.temp_schema.as_ref())?,
-                file_writer_options()?,
-            )?;
-            self.temp_writers[bucket_id] = Some(writer);
-        }
-        Ok(self.temp_writers[bucket_id]
-            .as_mut()
-            .expect("temp writer initialized"))
-    }
-
-    /// Rewrite one temporary bucket into its final on-disk representation.
-    ///
-    /// All rows for the bucket are loaded, sorted by partition id, and written
-    /// to a single final bucket file that stores only the row id and PQ code.
-    /// The manifest is updated with the row ranges for each partition contained
-    /// in this bucket.
-    async fn finalize_bucket(
-        &self,
-        bucket_id: usize,
-        partitions: &mut [PartitionArtifactPartition],
-    ) -> Result<Option<String>> {
-        let temp_path = self.temp_bucket_path(bucket_id);
-        if !self.object_store.exists(&temp_path).await? {
-            return Ok(None);
-        }
-
-        let reader = FileReader::try_open(
-            ScanScheduler::new(
-                self.object_store.clone(),
-                SchedulerConfig::max_bandwidth(&self.object_store),
-            )
-            .open_file(&temp_path, &CachedFileSize::unknown())
-            .await?,
-            None,
-            Arc::<DecoderPlugins>::default(),
-            &LanceCache::no_cache(),
-            FileReaderOptions::default(),
-        )
-        .await?;
-
-        let batches = reader
-            .read_stream(
-                ReadBatchParams::RangeFull,
-                u32::MAX,
-                16,
-                FilterExpression::no_filter(),
-            )?
-            .try_collect::<Vec<_>>()
-            .await?;
-        let total_rows = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
-        if total_rows == 0 {
-            self.object_store.delete(&temp_path).await?;
-            return Ok(None);
-        }
-
-        let mut row_ids = Vec::with_capacity(total_rows);
-        let mut partition_ids = Vec::with_capacity(total_rows);
-        let mut pq_values = Vec::with_capacity(total_rows * self.pq_code_width);
-        for batch in batches {
-            let batch_row_ids = batch[ROW_ID].as_primitive::<arrow::datatypes::UInt64Type>();
-            let batch_partition_ids =
-                batch[PART_ID_COLUMN].as_primitive::<arrow::datatypes::UInt32Type>();
-            let batch_pq = batch[PQ_CODE_COLUMN].as_fixed_size_list();
-            let batch_pq_values = batch_pq
-                .values()
-                .as_primitive::<arrow::datatypes::UInt8Type>();
-            row_ids.extend(batch_row_ids.values().iter().copied());
-            partition_ids.extend(batch_partition_ids.values().iter().copied());
-            pq_values.extend_from_slice(batch_pq_values.values().as_ref());
-        }
+        let total_rows = row_ids.len();
 
         let mut permutation = (0..total_rows).collect::<Vec<_>>();
-        permutation.sort_unstable_by_key(|&idx| partition_ids[idx]);
+        permutation.sort_unstable_by_key(|&idx| part_ids[idx]);
 
         let mut sorted_row_ids = Vec::with_capacity(total_rows);
         let mut sorted_partition_ids = Vec::with_capacity(total_rows);
         let mut sorted_pq_values = Vec::with_capacity(total_rows * self.pq_code_width);
         for idx in permutation {
-            sorted_row_ids.push(row_ids[idx]);
-            sorted_partition_ids.push(partition_ids[idx]);
+            sorted_row_ids.push(row_ids.value(idx));
+            sorted_partition_ids.push(part_ids[idx]);
             let start = idx * self.pq_code_width;
             let end = start + self.pq_code_width;
-            sorted_pq_values.extend_from_slice(&pq_values[start..end]);
+            sorted_pq_values.extend_from_slice(&pq_values.values()[start..end]);
         }
 
-        let final_path = self.final_bucket_path(bucket_id);
+        let file_offset = self.bucket_row_counts[bucket_id];
         let final_relative_path = self.final_bucket_relative_path(bucket_id);
-        let mut writer = FileWriter::try_new(
-            self.object_store.create(&final_path).await?,
-            Schema::try_from(self.final_schema.as_ref())?,
-            file_writer_options()?,
-        )?;
-        let final_batch = RecordBatch::try_new(
-            self.final_schema.clone(),
-            vec![
-                Arc::new(UInt64Array::from(sorted_row_ids)),
-                Arc::new(FixedSizeListArray::try_new_from_values(
-                    UInt8Array::from(sorted_pq_values),
-                    self.pq_code_width as i32,
-                )?),
-            ],
-        )?;
-        writer.write_batch(&final_batch).await?;
-        writer.finish().await?;
-
         let mut offset = 0usize;
         while offset < sorted_partition_ids.len() {
             let partition_id = sorted_partition_ids[offset] as usize;
@@ -467,28 +337,59 @@ impl PartitionArtifactBuilder {
             {
                 end += 1;
             }
-            partitions[partition_id] = PartitionArtifactPartition {
-                path: Some(final_relative_path.clone()),
-                num_rows: end - offset,
-                ranges: vec![PartitionArtifactRange {
-                    offset: offset as u64,
-                    num_rows: (end - offset) as u64,
-                }],
-            };
+            let partition = &mut self.partitions[partition_id];
+            match &partition.path {
+                Some(existing) if existing != &final_relative_path => {
+                    return Err(Error::io(format!(
+                        "partition {} is split across multiple bucket files: '{}' vs '{}'",
+                        partition_id, existing, final_relative_path
+                    )));
+                }
+                None => partition.path = Some(final_relative_path.clone()),
+                _ => {}
+            }
+            partition.num_rows += end - offset;
+            partition.ranges.push(PartitionArtifactRange {
+                offset: file_offset + offset as u64,
+                num_rows: (end - offset) as u64,
+            });
             offset = end;
         }
 
-        self.object_store.delete(&temp_path).await?;
-        Ok(Some(final_relative_path))
+        let pq_codes = FixedSizeListArray::try_new_from_values(
+            UInt8Array::from(sorted_pq_values),
+            self.pq_code_width as i32,
+        )?;
+        let final_batch = RecordBatch::try_new(
+            self.final_schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(sorted_row_ids)),
+                Arc::new(pq_codes),
+            ],
+        )?;
+        let writer = self.ensure_final_writer(bucket_id).await?;
+        writer.write_batch(&final_batch).await?;
+        self.bucket_row_counts[bucket_id] += total_rows as u64;
+        Ok(())
     }
 
-    /// Path of the temporary file used while accumulating one bucket.
-    fn temp_bucket_path(&self, bucket_id: usize) -> Path {
-        self.root_dir
-            .child(PARTITION_ARTIFACT_PARTITIONS_DIR)
-            .child(format!(
-                "{PARTITION_ARTIFACT_STAGING_PREFIX}{bucket_id:05}.lance"
-            ))
+    /// Lazily create the finalized writer for a bucket.
+    ///
+    /// Buckets that never receive rows never create a file, which keeps sparse
+    /// artifacts compact.
+    async fn ensure_final_writer(&mut self, bucket_id: usize) -> Result<&mut FileWriter> {
+        if self.final_writers[bucket_id].is_none() {
+            let path = self.final_bucket_path(bucket_id);
+            let writer = FileWriter::try_new(
+                self.object_store.create(&path).await?,
+                Schema::try_from(self.final_schema.as_ref())?,
+                file_writer_options()?,
+            )?;
+            self.final_writers[bucket_id] = Some(writer);
+        }
+        Ok(self.final_writers[bucket_id]
+            .as_mut()
+            .expect("final writer initialized"))
     }
 
     /// Path of the finalized file for one bucket.
@@ -1056,5 +957,52 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
+    }
+
+    #[tokio::test]
+    async fn partition_artifact_builder_records_multiple_ranges_for_repeated_flushes() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root_dir = tempdir.path().join("artifact");
+        fs::create_dir_all(&root_dir).unwrap();
+        let object_store = Arc::new(ObjectStore::local());
+        let root_path = Path::from_filesystem_path(&root_dir).unwrap();
+
+        let mut builder =
+            PartitionArtifactBuilder::try_new_with_store(object_store, root_path, 4, 2).unwrap();
+        let num_rows = PARTITION_ARTIFACT_BUCKET_BUFFER_ROWS + 1024;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(PART_ID_COLUMN, DataType::UInt32, false),
+            Field::new(
+                PQ_CODE_COLUMN,
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::UInt8, true)), 2),
+                true,
+            ),
+        ]));
+        let row_ids = UInt64Array::from_iter_values((0..num_rows as u64).into_iter());
+        let part_ids = UInt32Array::from_iter_values((0..num_rows).map(|_| 0_u32));
+        let pq_values = UInt8Array::from_iter_values((0..num_rows * 2).map(|v| (v % 251) as u8));
+        let pq_codes = FixedSizeListArray::try_new_from_values(pq_values, 2).unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(row_ids), Arc::new(part_ids), Arc::new(pq_codes)],
+        )
+        .unwrap();
+
+        builder.append_batch(&batch).await.unwrap();
+        builder.finish("metadata.lance", None).await.unwrap();
+
+        let manifest: PartitionArtifactManifest =
+            serde_json::from_slice(&fs::read(root_dir.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest.partitions[0].num_rows, num_rows);
+        assert_eq!(manifest.partitions[0].ranges.len(), 2);
+        assert_eq!(
+            manifest.partitions[0].ranges[0].num_rows,
+            PARTITION_ARTIFACT_BUCKET_BUFFER_ROWS as u64
+        );
+        assert_eq!(
+            manifest.partitions[0].ranges[1].offset,
+            PARTITION_ARTIFACT_BUCKET_BUFFER_ROWS as u64
+        );
     }
 }

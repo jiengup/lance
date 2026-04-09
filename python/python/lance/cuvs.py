@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 import tempfile
 from importlib import import_module
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -34,6 +34,7 @@ def build_vector_index_on_cuvs(
     num_partitions: int,
     num_sub_vectors: int,
     dst_dataset_uri: str | Path | None = None,
+    storage_options: Optional[dict[str, str]] = None,
     *,
     sample_rate: int = 256,
     max_iters: int = 50,
@@ -60,6 +61,7 @@ def build_vector_index_on_cuvs(
         max_iters=max_iters,
         num_bits=num_bits,
         filter_nan=filter_nan,
+        storage_options=storage_options,
     )
     artifact = backend.build_ivf_pq_artifact(
         dataset.uri,
@@ -68,6 +70,7 @@ def build_vector_index_on_cuvs(
         artifact_uri=artifact_uri,
         batch_size=batch_size,
         filter_nan=filter_nan,
+        storage_options=storage_options,
     )
     return (
         artifact.artifact_uri,

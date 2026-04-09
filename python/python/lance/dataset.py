@@ -2987,6 +2987,7 @@ class LanceDataset(pa.dataset.Dataset):
                     accelerator,
                     num_partitions,
                     num_sub_vectors,
+                    storage_options=storage_options,
                     sample_rate=kwargs.get("sample_rate", 256),
                     max_iters=kwargs.get("max_iters", 50),
                     num_bits=kwargs.get("num_bits", 8),
