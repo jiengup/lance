@@ -406,22 +406,17 @@ impl From<Schema> for ProjectionRequest {
 }
 
 impl Dataset {
-    /// Returns the stable row-id reservations that are still active on this
-    /// dataset version line.
-    ///
-    /// Reservations are consumed as one-time tokens by append commits. If an
-    /// append uses only a subrange, the unused remainder is still discarded.
-    pub fn reserved_row_ids(&self) -> &[ReservedRowIds] {
-        self.manifest.reserved_row_ids.as_slice()
-    }
-
     /// Returns the stable row-id range reserved by the current dataset version,
     /// if any.
     ///
     /// This only reports the reservation created by the current version's
-    /// `ReserveRowIds` transaction. Reservations are scoped to the current
-    /// version line and are not inherited by shallow clones.
-    pub async fn latest_reserved_row_ids(&self) -> Result<Option<ReservedRowIds>> {
+    /// `ReserveRowIds` transaction. It does not scan older versions or expose
+    /// a global list of outstanding reservations.
+    ///
+    /// In other words, this returns `Some(...)` only when the current dataset
+    /// version itself was produced by `ReserveRowIds`; otherwise it returns
+    /// `None`.
+    pub async fn reserved_row_ids(&self) -> Result<Option<ReservedRowIds>> {
         let Some(transaction) = self.read_transaction().await? else {
             return Ok(None);
         };
@@ -440,7 +435,7 @@ impl Dataset {
                         })?;
                 Ok(Some(ReservedRowIds {
                     start_row_id,
-                    count: num_rows,
+                    num_rows,
                 }))
             }
             _ => Ok(None),

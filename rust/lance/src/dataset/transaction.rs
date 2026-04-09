@@ -45,8 +45,6 @@ use std::{
 };
 use uuid::Uuid;
 
-const MAX_RESERVED_ROW_ID_RANGES: usize = 3;
-
 /// A change to a dataset that can be retried
 ///
 /// This contains enough information to be able to build the next manifest,
@@ -1607,22 +1605,13 @@ impl Transaction {
     fn reserved_row_ids_end(row_ids: &ReservedRowIds) -> Result<u64> {
         row_ids
             .start_row_id
-            .checked_add(row_ids.count)
+            .checked_add(row_ids.num_rows)
             .ok_or_else(|| {
                 Error::invalid_input(format!(
-                    "reserved row ids overflow: start_row_id={}, count={}",
-                    row_ids.start_row_id, row_ids.count
+                    "reserved row ids overflow: start_row_id={}, num_rows={}",
+                    row_ids.start_row_id, row_ids.num_rows
                 ))
             })
-    }
-
-    fn reserved_row_ids_contains(
-        reserved: &ReservedRowIds,
-        requested: &ReservedRowIds,
-    ) -> Result<bool> {
-        let reserved_end = Self::reserved_row_ids_end(reserved)?;
-        let requested_end = Self::reserved_row_ids_end(requested)?;
-        Ok(reserved.start_row_id <= requested.start_row_id && requested_end <= reserved_end)
     }
 
     pub(crate) async fn restore_old_manifest(
@@ -1740,10 +1729,6 @@ impl Transaction {
                 }
             }
         };
-        let mut reserved_row_ids = current_manifest
-            .map(|manifest| manifest.reserved_row_ids.clone())
-            .unwrap_or_default();
-
         let maybe_existing_fragments =
             current_manifest
                 .map(|m| m.fragments.as_ref())
@@ -1766,27 +1751,15 @@ impl Transaction {
                     Self::fragments_with_ids(fragments.clone(), &mut fragment_id)
                         .collect::<Vec<_>>();
                 match (&mut next_row_id, row_ids) {
-                    (Some(_), Some(row_ids)) => {
-                        let mut reservation_pos = None;
-                        for (idx, reserved) in reserved_row_ids.iter().enumerate() {
-                            if Self::reserved_row_ids_contains(reserved, row_ids)? {
-                                reservation_pos = Some(idx);
-                                break;
-                            }
+                    (Some(next_row_id), Some(row_ids)) => {
+                        let requested_end = Self::reserved_row_ids_end(row_ids)?;
+                        if requested_end > *next_row_id {
+                            return Err(Error::invalid_input(format!(
+                                "Requested row ids exceed next_row_id: start_row_id={}, num_rows={}, next_row_id={}",
+                                row_ids.start_row_id, row_ids.num_rows, next_row_id
+                            )));
                         }
-                        let reservation_pos = reservation_pos
-                            .ok_or_else(|| {
-                                Error::invalid_input(format!(
-                                    "Reserved row ids start_row_id={} count={} are not contained within any active reservation",
-                                    row_ids.start_row_id, row_ids.count
-                                ))
-                            })?;
-                        Self::assign_reserved_row_ids(row_ids, new_fragments.as_mut_slice())?;
-                        // Reservations are intentionally treated as one-time
-                        // tokens. A partial append still consumes the entire
-                        // reservation instead of leaving behind fragmented
-                        // subranges for future appends.
-                        reserved_row_ids.remove(reservation_pos);
+                        Self::assign_provided_row_ids(row_ids, new_fragments.as_mut_slice())?;
                     }
                     (Some(next_row_id), None) => {
                         Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
@@ -2143,17 +2116,6 @@ impl Transaction {
                         start_row_id, num_rows
                     ))
                 })?;
-                if reserved_row_ids.len() >= MAX_RESERVED_ROW_ID_RANGES {
-                    return Err(Error::invalid_input(format!(
-                        "Too many reserved row-id ranges: current={}, max={}",
-                        reserved_row_ids.len(),
-                        MAX_RESERVED_ROW_ID_RANGES
-                    )));
-                }
-                reserved_row_ids.push(ReservedRowIds {
-                    start_row_id,
-                    count: *num_rows,
-                });
                 *next_row_id = end_row_id;
             }
             Operation::Merge { fragments, .. } => {
@@ -2464,7 +2426,6 @@ impl Transaction {
         if let Some(next_row_id) = next_row_id {
             manifest.next_row_id = next_row_id;
         }
-        manifest.reserved_row_ids = reserved_row_ids;
 
         Ok((manifest, final_indices))
     }
@@ -2892,7 +2853,7 @@ impl Transaction {
         Ok(())
     }
 
-    fn assign_reserved_row_ids(row_ids: &ReservedRowIds, fragments: &mut [Fragment]) -> Result<()> {
+    fn assign_provided_row_ids(row_ids: &ReservedRowIds, fragments: &mut [Fragment]) -> Result<()> {
         let total_rows = fragments.iter().try_fold(0_u64, |total_rows, fragment| {
             let physical_rows = fragment
                 .physical_rows
@@ -2900,16 +2861,16 @@ impl Transaction {
                 as u64;
             total_rows.checked_add(physical_rows).ok_or_else(|| {
                 Error::invalid_input(format!(
-                    "reserved row id count overflow when summing fragment rows: total_rows={}, fragment_rows={}",
+                    "provided row id count overflow when summing fragment rows: total_rows={}, fragment_rows={}",
                     total_rows, physical_rows
                 ))
             })
         })?;
 
-        if total_rows != row_ids.count {
+        if total_rows > row_ids.num_rows {
             return Err(Error::invalid_input(format!(
-                "reserved row id count {} does not match appended row count {}",
-                row_ids.count, total_rows
+                "provided row id count {} is smaller than appended row count {}",
+                row_ids.num_rows, total_rows
             )));
         }
 
@@ -4074,49 +4035,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(next_manifest.next_row_id, 15);
-        assert_eq!(
-            next_manifest.reserved_row_ids,
-            vec![ReservedRowIds {
-                start_row_id: 10,
-                count: 5,
-            }]
-        );
-
-        let mut manifest = next_manifest;
-        for expected_count in [2, 3] {
-            let transaction = Transaction::new(
-                manifest.version,
-                Operation::ReserveRowIds {
-                    num_rows: expected_count,
-                },
-                None,
-            );
-
-            let (next_manifest, _) = transaction
-                .build_manifest(
-                    Some(&manifest),
-                    Vec::new(),
-                    "txn",
-                    &ManifestWriteConfig::default(),
-                )
-                .unwrap();
-            manifest = next_manifest;
-        }
-
-        let result = Transaction::new(
-            manifest.version,
-            Operation::ReserveRowIds { num_rows: 1 },
-            None,
-        )
-        .build_manifest(
-            Some(&manifest),
-            Vec::new(),
-            "txn",
-            &ManifestWriteConfig::default(),
-        );
-        let err = result.unwrap_err();
-        assert!(matches!(err, Error::InvalidInput { .. }));
-        assert!(err.to_string().contains("Too many reserved row-id ranges"));
     }
 
     #[test]

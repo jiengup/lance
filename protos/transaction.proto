@@ -41,9 +41,8 @@ message Transaction {
     repeated DataFragment fragments = 1;
     // Stable row ids to assign to the new rows, if pre-reserved.
     //
-    // The requested range must be contained within a currently active
-    // reservation. Once this append commits, that reservation is consumed as a
-    // one-time token, even if this append only uses a subrange.
+    // The requested range must be contained within the row ids reserved by the
+    // dataset version identified by read_version.
     ReservedRowIds row_ids = 2;
   }
 

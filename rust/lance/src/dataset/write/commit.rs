@@ -50,6 +50,67 @@ pub struct CommitBuilder<'a> {
 }
 
 impl<'a> CommitBuilder<'a> {
+    async fn validate_append_row_ids(
+        dest: &WriteDestination<'_>,
+        transaction: &Transaction,
+    ) -> Result<()> {
+        let (dataset, requested) = match (dest.dataset(), &transaction.operation) {
+            (
+                Some(dataset),
+                Operation::Append {
+                    row_ids: Some(requested),
+                    ..
+                },
+            ) => (dataset, requested),
+            _ => return Ok(()),
+        };
+
+        let base_dataset = if dataset.manifest.version == transaction.read_version {
+            dataset.as_ref().clone()
+        } else {
+            dataset.checkout_version(transaction.read_version).await?
+        };
+
+        let Some(base_reserved) = base_dataset.reserved_row_ids().await? else {
+            return Err(Error::invalid_input(format!(
+                "Append row ids require read_version {} to be a ReserveRowIds transaction",
+                transaction.read_version
+            )));
+        };
+
+        let requested_end = requested
+            .start_row_id
+            .checked_add(requested.num_rows)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Requested row ids overflow: start_row_id={}, num_rows={}",
+                    requested.start_row_id, requested.num_rows
+                ))
+            })?;
+        let reserved_end = base_reserved
+            .start_row_id
+            .checked_add(base_reserved.num_rows)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Reserved row ids overflow: start_row_id={}, num_rows={}",
+                    base_reserved.start_row_id, base_reserved.num_rows
+                ))
+            })?;
+
+        if base_reserved.start_row_id <= requested.start_row_id && requested_end <= reserved_end {
+            Ok(())
+        } else {
+            Err(Error::invalid_input(format!(
+                "Requested row ids start_row_id={} num_rows={} are not contained within the read_version {} reservation start_row_id={} num_rows={}",
+                requested.start_row_id,
+                requested.num_rows,
+                transaction.read_version,
+                base_reserved.start_row_id,
+                base_reserved.num_rows
+            )))
+        }
+    }
+
     pub fn new(dest: impl Into<WriteDestination<'a>>) -> Self {
         Self {
             dest: dest.into(),
@@ -266,6 +327,7 @@ impl<'a> CommitBuilder<'a> {
         } else {
             validate_operation(None, &transaction.operation)?;
         }
+        Self::validate_append_row_ids(&dest, &transaction).await?;
 
         let (metadata_cache, index_cache) = match &dest {
             WriteDestination::Dataset(ds) => (ds.metadata_cache.clone(), ds.index_cache.clone()),

@@ -348,25 +348,25 @@ mod test {
             .await
             .unwrap();
 
-        let reserved = dataset.latest_reserved_row_ids().await.unwrap().unwrap();
-        assert_eq!(dataset.reserved_row_ids(), std::slice::from_ref(&reserved));
+        let reserved = dataset.reserved_row_ids().await.unwrap().unwrap();
 
         let append_params = WriteParams {
             mode: WriteMode::Append,
             max_rows_per_file: 2,
             ..Default::default()
         };
+        let requested = ReservedRowIds {
+            start_row_id: reserved.start_row_id + 2,
+            num_rows: 5,
+        };
         let dataset = InsertBuilder::new(Arc::new(dataset))
-            .with_row_ids(ReservedRowIds {
-                start_row_id: reserved.start_row_id + 2,
-                count: 4,
-            })
+            .with_row_ids(requested.clone())
             .with_params(&append_params)
             .execute(vec![sequence_batch(100..104)])
             .await
             .unwrap();
 
-        assert!(dataset.reserved_row_ids().is_empty());
+        assert!(dataset.reserved_row_ids().await.unwrap().is_none());
         assert_eq!(dataset.get_fragments().len(), 2);
 
         let batch = dataset
@@ -384,6 +384,18 @@ mod test {
             .copied()
             .collect::<Vec<_>>();
         assert_eq!(row_ids, vec![2, 3, 4, 5]);
+
+        let invalid_reuse = InsertBuilder::new(Arc::new(dataset.clone()))
+            .with_row_ids(requested)
+            .with_params(&append_params)
+            .execute_uncommitted(vec![sequence_batch(200..202)])
+            .await
+            .unwrap();
+        let err = CommitBuilder::new(Arc::new(dataset))
+            .execute(invalid_reuse)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
     }
 
     #[tokio::test]
@@ -412,7 +424,7 @@ mod test {
             .execute(reserve_txn)
             .await
             .unwrap();
-        let reserved = dataset.latest_reserved_row_ids().await.unwrap().unwrap();
+        let reserved = dataset.reserved_row_ids().await.unwrap().unwrap();
 
         let append_params = WriteParams {
             mode: WriteMode::Append,
@@ -421,7 +433,7 @@ mod test {
         let first_transaction = InsertBuilder::new(Arc::new(dataset.clone()))
             .with_row_ids(ReservedRowIds {
                 start_row_id: reserved.start_row_id + 1,
-                count: 4,
+                num_rows: 4,
             })
             .with_params(&append_params)
             .execute_uncommitted(vec![sequence_batch(100..104)])
@@ -430,7 +442,7 @@ mod test {
         let second_transaction = InsertBuilder::new(Arc::new(dataset.clone()))
             .with_row_ids(ReservedRowIds {
                 start_row_id: reserved.start_row_id + 3,
-                count: 2,
+                num_rows: 2,
             })
             .with_params(&append_params)
             .execute_uncommitted(vec![sequence_batch(200..202)])

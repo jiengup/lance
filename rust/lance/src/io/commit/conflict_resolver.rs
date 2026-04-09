@@ -867,20 +867,20 @@ impl<'a> TransactionRebase<'a> {
         {
             let current_end = current_row_ids
                 .start_row_id
-                .checked_add(current_row_ids.count)
+                .checked_add(current_row_ids.num_rows)
                 .ok_or_else(|| {
                     Error::invalid_input(format!(
-                        "reserved row ids overflow: start_row_id={}, count={}",
-                        current_row_ids.start_row_id, current_row_ids.count
+                        "reserved row ids overflow: start_row_id={}, num_rows={}",
+                        current_row_ids.start_row_id, current_row_ids.num_rows
                     ))
                 })?;
             let other_end = other_row_ids
                 .start_row_id
-                .checked_add(other_row_ids.count)
+                .checked_add(other_row_ids.num_rows)
                 .ok_or_else(|| {
                     Error::invalid_input(format!(
-                        "reserved row ids overflow: start_row_id={}, count={}",
-                        other_row_ids.start_row_id, other_row_ids.count
+                        "reserved row ids overflow: start_row_id={}, num_rows={}",
+                        other_row_ids.start_row_id, other_row_ids.num_rows
                     ))
                 })?;
             if current_row_ids.start_row_id < other_end && other_row_ids.start_row_id < current_end
@@ -888,11 +888,11 @@ impl<'a> TransactionRebase<'a> {
                 return Err(Error::commit_conflict_source(
                 other_version,
                 format!(
-                    "Reserved row ids overlap with a concurrent append: current start_row_id={} count={}, other start_row_id={} count={}",
+                    "Reserved row ids overlap with a concurrent append: current start_row_id={} num_rows={}, other start_row_id={} num_rows={}",
                     current_row_ids.start_row_id,
-                    current_row_ids.count,
+                    current_row_ids.num_rows,
                     other_row_ids.start_row_id,
-                    other_row_ids.count
+                    other_row_ids.num_rows
                 )
                 .into(),
             ));
