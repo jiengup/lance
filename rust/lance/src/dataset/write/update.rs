@@ -15,7 +15,7 @@ use crate::{Dataset, io::exec::Planner};
 use crate::{Error, Result};
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, DataType, Schema as ArrowSchema};
-use datafusion::common::DFSchema;
+use datafusion::common::{DFSchema, tree_node::TreeNode};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::ExprSchemable;
 use datafusion::physical_plan::PhysicalExpr;
@@ -24,6 +24,8 @@ use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
 use lance_arrow::RecordBatchExt;
+use lance_core::ROW_ID;
+use lance_core::datatypes::Projection;
 use lance_core::error::{InvalidInputSnafu, box_error};
 use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -80,17 +82,21 @@ impl UpdateBuilder {
     }
 
     pub fn update_where(mut self, filter: &str) -> Result<Self> {
-        let planner = Planner::new(Arc::new(self.dataset.schema().into()));
+        let planner = Planner::new(update_planner_schema(self.dataset.clone()));
         let expr = planner
             .parse_filter(filter)
             .map_err(box_error)
             .context(InvalidInputSnafu {})?;
-        self.condition = Some(
-            planner
-                .optimize_expr(expr)
-                .map_err(box_error)
-                .context(InvalidInputSnafu {})?,
-        );
+        let expr = planner
+            .optimize_expr(expr)
+            .map_err(box_error)
+            .context(InvalidInputSnafu {})?;
+        validate_row_id_reference(
+            self.dataset.as_ref(),
+            &expr,
+            "Update filter references _rowid",
+        )?;
+        self.condition = Some(expr);
         Ok(self)
     }
 
@@ -119,7 +125,7 @@ impl UpdateBuilder {
             ));
         }
 
-        let schema: Arc<ArrowSchema> = Arc::new(self.dataset.schema().into());
+        let schema = update_planner_schema(self.dataset.clone());
         let planner = Planner::new(schema.clone());
         let mut expr = planner
             .parse_expr(value)
@@ -165,6 +171,14 @@ impl UpdateBuilder {
             .optimize_expr(expr)
             .map_err(box_error)
             .context(InvalidInputSnafu {})?;
+        validate_row_id_reference(
+            self.dataset.as_ref(),
+            &expr,
+            &format!(
+                "Update expression for column '{}' references _rowid",
+                column.as_ref()
+            ),
+        )?;
 
         self.updates.insert(column.as_ref().to_string(), expr);
         Ok(self)
@@ -192,7 +206,7 @@ impl UpdateBuilder {
     pub fn build(self) -> Result<UpdateJob> {
         let mut updates = HashMap::new();
 
-        let planner = Planner::new(Arc::new(self.dataset.schema().into()));
+        let planner = Planner::new(update_planner_schema(self.dataset.clone()));
 
         for (column, expr) in self.updates {
             let physical_expr = planner.create_physical_expr(&expr)?;
@@ -261,19 +275,13 @@ impl UpdateJob {
         }
 
         let stream = scanner.try_into_stream().await?.into();
-
-        // We keep track of seen row ids so we can delete them from the existing
-        // fragments and then set the row id segments in the new fragments.
-        let (stream, row_id_rx) =
-            make_rowid_capture_stream(stream, self.dataset.manifest.uses_stable_row_ids())?;
-
         let schema = stream.schema();
 
-        let expected_schema = self.dataset.schema().into();
-        if schema.as_ref() != &expected_schema {
+        let expected_input_schema = update_planner_schema(self.dataset.clone());
+        if schema.as_ref() != expected_input_schema.as_ref() {
             return Err(Error::internal(format!(
                 "Expected schema {:?} but got {:?}",
-                expected_schema, schema
+                expected_input_schema, schema
             )));
         }
 
@@ -290,6 +298,22 @@ impl UpdateJob {
                 Err(e) => Err(DataFusionError::ExecutionJoin(Box::new(e))),
             });
         let stream = RecordBatchStreamAdapter::new(schema, stream);
+
+        // We keep track of seen row ids so we can delete them from the existing
+        // fragments and then set the row id segments in the new fragments.
+        let (stream, row_id_rx) = make_rowid_capture_stream(
+            Box::pin(stream),
+            self.dataset.manifest.uses_stable_row_ids(),
+        )?;
+
+        let expected_schema = Arc::new(ArrowSchema::from(self.dataset.schema()));
+        if stream.schema().as_ref() != expected_schema.as_ref() {
+            return Err(Error::internal(format!(
+                "Expected output schema {:?} but got {:?}",
+                expected_schema,
+                stream.schema()
+            )));
+        }
 
         let version = self
             .dataset
@@ -470,6 +494,30 @@ impl RetryExecutor for UpdateJob {
     }
 }
 
+fn update_planner_schema(dataset: Arc<Dataset>) -> Arc<ArrowSchema> {
+    Arc::new(Projection::full(dataset).with_row_id().to_schema().into())
+}
+
+fn expr_references_row_id(expr: &Expr) -> Result<bool> {
+    expr.exists(|expr| Ok(matches!(expr, Expr::Column(column) if column.name == ROW_ID)))
+        .map_err(|err| {
+            Error::internal(format!(
+                "Failed to inspect update expression for _rowid references: {}",
+                err
+            ))
+        })
+}
+
+fn validate_row_id_reference(dataset: &Dataset, expr: &Expr, context: &str) -> Result<()> {
+    if expr_references_row_id(expr)? && !dataset.manifest.uses_stable_row_ids() {
+        return Err(Error::invalid_input(format!(
+            "{}. `_rowid` can only be used in dataset.update when stable row ids are enabled for the dataset",
+            context
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -546,6 +594,40 @@ mod tests {
         (Arc::new(ds), test_dir)
     }
 
+    fn row_ids(batch: &RecordBatch) -> &UInt64Array {
+        batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+    }
+
+    fn ids(batch: &RecordBatch) -> &Int64Array {
+        batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+    }
+
+    fn names(batch: &RecordBatch) -> &StringArray {
+        batch
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+    }
+
+    fn row_id_for_id(batch: &RecordBatch, target_id: i64) -> u64 {
+        let row_ids = row_ids(batch);
+        let ids = ids(batch);
+        let target_idx = ids.values().iter().position(|id| *id == target_id).unwrap();
+        row_ids.value(target_idx)
+    }
+
     #[tokio::test]
     async fn test_update_validation() {
         let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::Legacy, false).await;
@@ -580,6 +662,18 @@ mod tests {
             matches!(builder.build(), Err(Error::InvalidInput { .. })),
             "Should return error if no update expressions are provided"
         );
+    }
+
+    #[tokio::test]
+    async fn test_update_by_row_id_requires_stable_ids() {
+        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::V2_0, false).await;
+
+        let err = UpdateBuilder::new(dataset)
+            .update_where("_rowid = 10")
+            .unwrap_err();
+
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("stable row ids are enabled"));
     }
 
     #[rstest]
@@ -901,18 +995,8 @@ mod tests {
         let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::V2_0, true).await;
 
         let orig_batch = dataset.scan().with_row_id().try_into_batch().await.unwrap();
-        let orig_row_ids = orig_batch
-            .column_by_name(ROW_ID)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-        let orig_ids = orig_batch
-            .column_by_name("id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
+        let orig_row_ids = row_ids(&orig_batch);
+        let orig_ids = ids(&orig_batch);
 
         let updated_batch = UpdateBuilder::new(dataset)
             .update_where("id >= 15")
@@ -931,21 +1015,130 @@ mod tests {
             .await
             .unwrap();
 
-        let updated_row_ids = updated_batch
-            .column_by_name(ROW_ID)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-        let updated_ids = updated_batch
-            .column_by_name("id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
+        let updated_row_ids = row_ids(&updated_batch);
+        let updated_ids = ids(&updated_batch);
 
         assert_eq!(orig_row_ids, updated_row_ids);
         assert_eq!(orig_ids, updated_ids);
+    }
+
+    #[tokio::test]
+    async fn test_update_by_row_id() {
+        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::V2_0, true).await;
+
+        let orig_batch = dataset.scan().with_row_id().try_into_batch().await.unwrap();
+        let orig_row_ids = row_ids(&orig_batch);
+        let target_row_id = row_id_for_id(&orig_batch, 7);
+
+        let updated_batch = UpdateBuilder::new(dataset)
+            .update_where(&format!("{ROW_ID} = {target_row_id}"))
+            .unwrap()
+            .set("name", "'picked'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset
+            .scan()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let updated_row_ids = row_ids(&updated_batch);
+        let updated_names = names(&updated_batch);
+
+        assert_eq!(orig_row_ids, updated_row_ids);
+        for idx in 0..updated_batch.num_rows() {
+            let expected_name = if updated_row_ids.value(idx) == target_row_id {
+                "picked"
+            } else {
+                "foo"
+            };
+            assert_eq!(updated_names.value(idx), expected_name);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_by_row_ids() {
+        use std::collections::HashSet;
+
+        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::V2_0, true).await;
+
+        let orig_batch = dataset.scan().with_row_id().try_into_batch().await.unwrap();
+        let orig_row_ids = row_ids(&orig_batch);
+        let selected_row_ids = [3, 15, 22]
+            .into_iter()
+            .map(|target_id| row_id_for_id(&orig_batch, target_id))
+            .collect::<Vec<_>>();
+        let selected_row_ids_sql = selected_row_ids
+            .iter()
+            .map(|row_id| row_id.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let updated_batch = UpdateBuilder::new(dataset)
+            .update_where(&format!("{ROW_ID} IN ({selected_row_ids_sql})"))
+            .unwrap()
+            .set("name", "'selected'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset
+            .scan()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let updated_row_ids = row_ids(&updated_batch);
+        let updated_names = names(&updated_batch);
+        let selected_row_ids = selected_row_ids.into_iter().collect::<HashSet<_>>();
+
+        assert_eq!(orig_row_ids, updated_row_ids);
+        for idx in 0..updated_batch.num_rows() {
+            let expected_name = if selected_row_ids.contains(&updated_row_ids.value(idx)) {
+                "selected"
+            } else {
+                "foo"
+            };
+            assert_eq!(updated_names.value(idx), expected_name);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_expr_can_use_row_id() {
+        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::V2_0, true).await;
+
+        let updated_batch = UpdateBuilder::new(dataset)
+            .set("name", "cast(_rowid as string)")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset
+            .scan()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let updated_row_ids = row_ids(&updated_batch);
+        let updated_names = names(&updated_batch);
+
+        for idx in 0..updated_batch.num_rows() {
+            assert_eq!(
+                updated_names.value(idx),
+                updated_row_ids.value(idx).to_string()
+            );
+        }
     }
 
     #[tokio::test]
@@ -955,24 +1148,9 @@ mod tests {
         let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::V2_0, true).await;
 
         let orig_batch = dataset.scan().with_row_id().try_into_batch().await.unwrap();
-        let orig_row_ids = orig_batch
-            .column_by_name(ROW_ID)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-        let orig_ids = orig_batch
-            .column_by_name("id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        let orig_names = orig_batch
-            .column_by_name("name")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let orig_row_ids = row_ids(&orig_batch);
+        let orig_ids = ids(&orig_batch);
+        let orig_names = names(&orig_batch);
 
         let updated_batch = UpdateBuilder::new(dataset)
             .update_where("id % 2 = 1")
@@ -991,24 +1169,9 @@ mod tests {
             .await
             .unwrap();
 
-        let updated_row_ids = updated_batch
-            .column_by_name(ROW_ID)
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-        let updated_ids = updated_batch
-            .column_by_name("id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        let updated_names = updated_batch
-            .column_by_name("name")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let updated_row_ids = row_ids(&updated_batch);
+        let updated_ids = ids(&updated_batch);
+        let updated_names = names(&updated_batch);
 
         assert_eq!(
             orig_row_ids
