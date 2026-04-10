@@ -18,8 +18,8 @@ use arrow_schema::{ArrowError, DataType, Schema as ArrowSchema};
 use datafusion::common::{DFSchema, tree_node::TreeNode};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::ExprSchemable;
-use datafusion::physical_plan::PhysicalExpr;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{PhysicalExpr, SendableRecordBatchStream};
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
@@ -274,7 +274,7 @@ impl UpdateJob {
             scanner.filter_expr(expr.clone());
         }
 
-        let stream = scanner.try_into_stream().await?.into();
+        let stream: SendableRecordBatchStream = scanner.try_into_stream().await?.into();
         let schema = stream.schema();
 
         let expected_input_schema = update_planner_schema(self.dataset.clone());
@@ -297,14 +297,13 @@ impl UpdateJob {
                 Ok(Err(err)) => Err(err),
                 Err(e) => Err(DataFusionError::ExecutionJoin(Box::new(e))),
             });
-        let stream = RecordBatchStreamAdapter::new(schema, stream);
+        let stream: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream));
 
         // We keep track of seen row ids so we can delete them from the existing
         // fragments and then set the row id segments in the new fragments.
-        let (stream, row_id_rx) = make_rowid_capture_stream(
-            Box::pin(stream),
-            self.dataset.manifest.uses_stable_row_ids(),
-        )?;
+        let (stream, row_id_rx) =
+            make_rowid_capture_stream(stream, self.dataset.manifest.uses_stable_row_ids())?;
 
         let expected_schema = Arc::new(ArrowSchema::from(self.dataset.schema()));
         if stream.schema().as_ref() != expected_schema.as_ref() {
@@ -325,7 +324,7 @@ impl UpdateJob {
             self.dataset.object_store.clone(),
             &self.dataset.base,
             self.dataset.schema().clone(),
-            Box::pin(stream),
+            stream,
             WriteParams::with_storage_version(version),
             None, // TODO: support multiple bases for update
         )
@@ -495,7 +494,7 @@ impl RetryExecutor for UpdateJob {
 }
 
 fn update_planner_schema(dataset: Arc<Dataset>) -> Arc<ArrowSchema> {
-    Arc::new(Projection::full(dataset).with_row_id().to_schema().into())
+    Arc::new((&Projection::full(dataset).with_row_id().to_schema()).into())
 }
 
 fn expr_references_row_id(expr: &Expr) -> Result<bool> {
@@ -626,6 +625,28 @@ mod tests {
         let ids = ids(batch);
         let target_idx = ids.values().iter().position(|id| *id == target_id).unwrap();
         row_ids.value(target_idx)
+    }
+
+    fn row_id_to_id(batch: &RecordBatch) -> BTreeMap<u64, i64> {
+        let row_ids = row_ids(batch);
+        let ids = ids(batch);
+        row_ids
+            .values()
+            .iter()
+            .copied()
+            .zip(ids.values().iter().copied())
+            .collect()
+    }
+
+    fn row_id_to_name(batch: &RecordBatch) -> BTreeMap<u64, String> {
+        let row_ids = row_ids(batch);
+        let names = names(batch);
+        row_ids
+            .values()
+            .iter()
+            .copied()
+            .zip(names.iter().map(|name| name.unwrap().to_string()))
+            .collect()
     }
 
     #[tokio::test]
@@ -995,8 +1016,7 @@ mod tests {
         let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::V2_0, true).await;
 
         let orig_batch = dataset.scan().with_row_id().try_into_batch().await.unwrap();
-        let orig_row_ids = row_ids(&orig_batch);
-        let orig_ids = ids(&orig_batch);
+        let orig_rows = row_id_to_id(&orig_batch);
 
         let updated_batch = UpdateBuilder::new(dataset)
             .update_where("id >= 15")
@@ -1015,11 +1035,7 @@ mod tests {
             .await
             .unwrap();
 
-        let updated_row_ids = row_ids(&updated_batch);
-        let updated_ids = ids(&updated_batch);
-
-        assert_eq!(orig_row_ids, updated_row_ids);
-        assert_eq!(orig_ids, updated_ids);
+        assert_eq!(orig_rows, row_id_to_id(&updated_batch));
     }
 
     #[tokio::test]
@@ -1027,7 +1043,7 @@ mod tests {
         let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::V2_0, true).await;
 
         let orig_batch = dataset.scan().with_row_id().try_into_batch().await.unwrap();
-        let orig_row_ids = row_ids(&orig_batch);
+        let orig_row_ids = row_id_to_id(&orig_batch).into_keys().collect::<Vec<_>>();
         let target_row_id = row_id_for_id(&orig_batch, 7);
 
         let updated_batch = UpdateBuilder::new(dataset)
@@ -1047,17 +1063,19 @@ mod tests {
             .await
             .unwrap();
 
-        let updated_row_ids = row_ids(&updated_batch);
-        let updated_names = names(&updated_batch);
+        let updated_names = row_id_to_name(&updated_batch);
 
-        assert_eq!(orig_row_ids, updated_row_ids);
-        for idx in 0..updated_batch.num_rows() {
-            let expected_name = if updated_row_ids.value(idx) == target_row_id {
+        assert_eq!(
+            orig_row_ids,
+            updated_names.keys().copied().collect::<Vec<_>>()
+        );
+        for (row_id, name) in updated_names {
+            let expected_name = if row_id == target_row_id {
                 "picked"
             } else {
                 "foo"
             };
-            assert_eq!(updated_names.value(idx), expected_name);
+            assert_eq!(name, expected_name);
         }
     }
 
@@ -1068,7 +1086,7 @@ mod tests {
         let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::V2_0, true).await;
 
         let orig_batch = dataset.scan().with_row_id().try_into_batch().await.unwrap();
-        let orig_row_ids = row_ids(&orig_batch);
+        let orig_row_ids = row_id_to_id(&orig_batch).into_keys().collect::<Vec<_>>();
         let selected_row_ids = [3, 15, 22]
             .into_iter()
             .map(|target_id| row_id_for_id(&orig_batch, target_id))
@@ -1096,18 +1114,20 @@ mod tests {
             .await
             .unwrap();
 
-        let updated_row_ids = row_ids(&updated_batch);
-        let updated_names = names(&updated_batch);
+        let updated_names = row_id_to_name(&updated_batch);
         let selected_row_ids = selected_row_ids.into_iter().collect::<HashSet<_>>();
 
-        assert_eq!(orig_row_ids, updated_row_ids);
-        for idx in 0..updated_batch.num_rows() {
-            let expected_name = if selected_row_ids.contains(&updated_row_ids.value(idx)) {
+        assert_eq!(
+            orig_row_ids,
+            updated_names.keys().copied().collect::<Vec<_>>()
+        );
+        for (row_id, name) in updated_names {
+            let expected_name = if selected_row_ids.contains(&row_id) {
                 "selected"
             } else {
                 "foo"
             };
-            assert_eq!(updated_names.value(idx), expected_name);
+            assert_eq!(name, expected_name);
         }
     }
 
