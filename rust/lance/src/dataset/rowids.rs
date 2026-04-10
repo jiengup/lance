@@ -135,7 +135,7 @@ mod test {
 
     use crate::dataset::transaction::{Operation, TransactionBuilder};
     use crate::dataset::{
-        CommitBuilder, InsertBuilder, ReservedRowIds, UpdateBuilder, WriteMode, WriteParams,
+        CommitBuilder, InsertBuilder, RowIdRange, UpdateBuilder, WriteMode, WriteParams,
         builder::DatasetBuilder,
     };
 
@@ -349,24 +349,32 @@ mod test {
             .unwrap();
 
         let reserved = dataset.reserved_row_ids().await.unwrap().unwrap();
+        assert!(dataset.generated_row_ids().await.unwrap().is_none());
 
         let append_params = WriteParams {
             mode: WriteMode::Append,
             max_rows_per_file: 2,
             ..Default::default()
         };
-        let requested = ReservedRowIds {
+        let row_id_range = RowIdRange {
             start_row_id: reserved.start_row_id + 2,
             num_rows: 5,
         };
         let dataset = InsertBuilder::new(Arc::new(dataset))
-            .with_row_ids(requested.clone())
+            .with_row_ids(row_id_range.clone())
             .with_params(&append_params)
             .execute(vec![sequence_batch(100..104)])
             .await
             .unwrap();
 
         assert!(dataset.reserved_row_ids().await.unwrap().is_none());
+        assert_eq!(
+            dataset.generated_row_ids().await.unwrap(),
+            Some(RowIdRange {
+                start_row_id: 2,
+                num_rows: 4,
+            })
+        );
         assert_eq!(dataset.get_fragments().len(), 2);
 
         let batch = dataset
@@ -386,7 +394,7 @@ mod test {
         assert_eq!(row_ids, vec![2, 3, 4, 5]);
 
         let invalid_reuse = InsertBuilder::new(Arc::new(dataset.clone()))
-            .with_row_ids(requested)
+            .with_row_ids(row_id_range)
             .with_params(&append_params)
             .execute_uncommitted(vec![sequence_batch(200..202)])
             .await
@@ -431,7 +439,7 @@ mod test {
             ..Default::default()
         };
         let first_transaction = InsertBuilder::new(Arc::new(dataset.clone()))
-            .with_row_ids(ReservedRowIds {
+            .with_row_ids(RowIdRange {
                 start_row_id: reserved.start_row_id + 1,
                 num_rows: 4,
             })
@@ -440,7 +448,7 @@ mod test {
             .await
             .unwrap();
         let second_transaction = InsertBuilder::new(Arc::new(dataset.clone()))
-            .with_row_ids(ReservedRowIds {
+            .with_row_ids(RowIdRange {
                 start_row_id: reserved.start_row_id + 3,
                 num_rows: 2,
             })
@@ -461,6 +469,107 @@ mod test {
         let err = result.unwrap_err();
         assert!(matches!(err, Error::CommitConflict { .. }));
         assert!(err.to_string().contains("Reserved row ids overlap"));
+    }
+
+    #[tokio::test]
+    async fn test_generated_row_ids_create_and_append() {
+        let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let tmp_path = &temp_dir;
+        let batch = sequence_batch(0..4);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+
+        let dataset = Dataset::write(
+            reader,
+            tmp_path,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            dataset.generated_row_ids().await.unwrap(),
+            Some(RowIdRange {
+                start_row_id: 0,
+                num_rows: 4,
+            })
+        );
+
+        let append_batch = sequence_batch(10..13);
+        let reader =
+            RecordBatchIterator::new(vec![Ok(append_batch.clone())], append_batch.schema());
+        let dataset = Dataset::write(
+            reader,
+            tmp_path,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            dataset.generated_row_ids().await.unwrap(),
+            Some(RowIdRange {
+                start_row_id: 4,
+                num_rows: 3,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generated_row_ids_overwrite() {
+        let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let tmp_path = &temp_dir;
+        let batch = sequence_batch(0..4);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+
+        let _dataset = Dataset::write(
+            reader,
+            tmp_path,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let overwrite_batch = sequence_batch(100..103);
+        let reader =
+            RecordBatchIterator::new(vec![Ok(overwrite_batch.clone())], overwrite_batch.schema());
+        let dataset = Dataset::write(
+            reader,
+            tmp_path,
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            dataset.generated_row_ids().await.unwrap(),
+            Some(RowIdRange {
+                start_row_id: 4,
+                num_rows: 3,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generated_row_ids_require_stable_row_ids() {
+        let uri = "memory://generated-row-ids-require-stable";
+        let batch = sequence_batch(0..2);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let dataset = Dataset::write(reader, uri, None).await.unwrap();
+
+        let err = dataset.generated_row_ids().await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
     }
 
     #[tokio::test]

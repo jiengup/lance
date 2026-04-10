@@ -25,10 +25,10 @@ use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
 use lance_io::utils::read_struct;
 
 #[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
-pub struct ReservedRowIds {
-    /// The first stable row id in the reserved range.
+pub struct RowIdRange {
+    /// The first stable row id in the range.
     pub start_row_id: u64,
-    /// The number of stable row ids in the reserved range.
+    /// The number of stable row ids in the range.
     pub num_rows: u64,
 }
 
@@ -849,8 +849,8 @@ impl From<BasePath> for pb::BasePath {
     }
 }
 
-impl From<pb::transaction::append::ReservedRowIds> for ReservedRowIds {
-    fn from(value: pb::transaction::append::ReservedRowIds) -> Self {
+impl From<pb::transaction::append::RowIdRange> for RowIdRange {
+    fn from(value: pb::transaction::append::RowIdRange) -> Self {
         Self {
             start_row_id: value.start_row_id,
             num_rows: value.num_rows,
@@ -858,8 +858,8 @@ impl From<pb::transaction::append::ReservedRowIds> for ReservedRowIds {
     }
 }
 
-impl From<&ReservedRowIds> for pb::transaction::append::ReservedRowIds {
-    fn from(value: &ReservedRowIds) -> Self {
+impl From<&RowIdRange> for pb::transaction::append::RowIdRange {
+    fn from(value: &RowIdRange) -> Self {
         Self {
             start_row_id: value.start_row_id,
             num_rows: value.num_rows,

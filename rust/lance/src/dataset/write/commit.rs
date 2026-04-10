@@ -59,7 +59,7 @@ impl<'a> CommitBuilder<'a> {
         };
 
         let Operation::Append {
-            row_ids: Some(requested_row_ids),
+            row_ids: Some(row_id_range),
             ..
         } = &transaction.operation
         else {
@@ -79,13 +79,13 @@ impl<'a> CommitBuilder<'a> {
             )));
         };
 
-        let requested_end_row_id = requested_row_ids
+        let requested_end_row_id = row_id_range
             .start_row_id
-            .checked_add(requested_row_ids.num_rows)
+            .checked_add(row_id_range.num_rows)
             .ok_or_else(|| {
                 Error::invalid_input(format!(
                     "Requested row ids overflow: start_row_id={}, num_rows={}",
-                    requested_row_ids.start_row_id, requested_row_ids.num_rows
+                    row_id_range.start_row_id, row_id_range.num_rows
                 ))
             })?;
         let reserved_end_row_id = reserved_row_ids
@@ -98,8 +98,7 @@ impl<'a> CommitBuilder<'a> {
                 ))
             })?;
 
-        let requested_within_reserved = reserved_row_ids.start_row_id
-            <= requested_row_ids.start_row_id
+        let requested_within_reserved = reserved_row_ids.start_row_id <= row_id_range.start_row_id
             && requested_end_row_id <= reserved_end_row_id;
 
         if requested_within_reserved {
@@ -107,8 +106,8 @@ impl<'a> CommitBuilder<'a> {
         } else {
             Err(Error::invalid_input(format!(
                 "Requested row ids start_row_id={} num_rows={} are not contained within the read_version {} reservation start_row_id={} num_rows={}",
-                requested_row_ids.start_row_id,
-                requested_row_ids.num_rows,
+                row_id_range.start_row_id,
+                row_id_range.num_rows,
                 transaction.read_version,
                 reserved_row_ids.start_row_id,
                 reserved_row_ids.num_rows

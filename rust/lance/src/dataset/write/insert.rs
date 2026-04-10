@@ -14,7 +14,7 @@ use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::can_write_dataset;
-use lance_table::format::{Fragment, ReservedRowIds};
+use lance_table::format::{Fragment, RowIdRange};
 use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
 
@@ -49,7 +49,7 @@ pub struct InsertBuilder<'a> {
     // TODO: make these parameters a part of the builder, and add specific methods.
     params: Option<&'a WriteParams>,
     write_progress: Option<WriteProgressFn>,
-    row_ids: Option<ReservedRowIds>,
+    row_ids: Option<RowIdRange>,
 }
 
 impl<'a> InsertBuilder<'a> {
@@ -91,8 +91,8 @@ impl<'a> InsertBuilder<'a> {
     /// same reservation, as long as each append still uses the reserve
     /// transaction's version as its `read_version` and the requested ranges do
     /// not overlap with each other.
-    pub fn with_row_ids(mut self, row_ids: ReservedRowIds) -> Self {
-        self.row_ids = Some(row_ids);
+    pub fn with_row_ids(mut self, row_id_range: RowIdRange) -> Self {
+        self.row_ids = Some(row_id_range);
         self
     }
 

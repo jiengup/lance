@@ -28,7 +28,7 @@ use lance_table::rowids::read_row_ids;
 use lance_table::{
     format::{
         BasePath, DataFile, DataStorageFormat, Fragment, IndexFile, IndexMetadata, Manifest,
-        ReservedRowIds, RowIdMeta, pb,
+        RowIdMeta, RowIdRange, pb,
     },
     io::{
         commit::CommitHandler,
@@ -115,7 +115,7 @@ pub enum Operation {
     /// haven't yet been assigned a final ID.
     Append {
         fragments: Vec<Fragment>,
-        row_ids: Option<ReservedRowIds>,
+        row_ids: Option<RowIdRange>,
     },
     /// Updated fragments contain those that have been modified with new deletion
     /// files. The deleted fragment IDs are those that should be removed from
@@ -1602,14 +1602,14 @@ impl Transaction {
         }
     }
 
-    fn reserved_row_ids_end(row_ids: &ReservedRowIds) -> Result<u64> {
-        row_ids
+    fn row_id_range_end(row_id_range: &RowIdRange) -> Result<u64> {
+        row_id_range
             .start_row_id
-            .checked_add(row_ids.num_rows)
+            .checked_add(row_id_range.num_rows)
             .ok_or_else(|| {
                 Error::invalid_input(format!(
-                    "reserved row ids overflow: start_row_id={}, num_rows={}",
-                    row_ids.start_row_id, row_ids.num_rows
+                    "row id range overflow: start_row_id={}, num_rows={}",
+                    row_id_range.start_row_id, row_id_range.num_rows
                 ))
             })
     }
@@ -1752,7 +1752,7 @@ impl Transaction {
                         .collect::<Vec<_>>();
                 match (&mut next_row_id, row_ids) {
                     (Some(next_row_id), Some(row_ids)) => {
-                        let requested_end = Self::reserved_row_ids_end(row_ids)?;
+                        let requested_end = Self::row_id_range_end(row_ids)?;
                         if requested_end > *next_row_id {
                             return Err(Error::invalid_input(format!(
                                 "Requested row ids exceed next_row_id: start_row_id={}, num_rows={}, next_row_id={}",
@@ -2853,7 +2853,7 @@ impl Transaction {
         Ok(())
     }
 
-    fn assign_provided_row_ids(row_ids: &ReservedRowIds, fragments: &mut [Fragment]) -> Result<()> {
+    fn assign_provided_row_ids(row_ids: &RowIdRange, fragments: &mut [Fragment]) -> Result<()> {
         let total_rows = fragments.iter().try_fold(0_u64, |total_rows, fragment| {
             let physical_rows = fragment
                 .physical_rows
@@ -2945,7 +2945,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .into_iter()
                     .map(Fragment::try_from)
                     .collect::<Result<Vec<_>>>()?,
-                row_ids: row_ids.map(ReservedRowIds::from),
+                row_ids: row_ids.map(RowIdRange::from),
             },
             Some(pb::transaction::Operation::Clone(pb::transaction::Clone {
                 is_shallow,
@@ -3302,7 +3302,7 @@ impl From<&Transaction> for pb::Transaction {
                     fragments: fragments.iter().map(pb::DataFragment::from).collect(),
                     row_ids: row_ids
                         .as_ref()
-                        .map(pb::transaction::append::ReservedRowIds::from),
+                        .map(pb::transaction::append::RowIdRange::from),
                 })
             }
             Operation::Clone {

@@ -35,7 +35,7 @@ message Transaction {
 
   // Add new rows to the dataset.
   message Append {
-    message ReservedRowIds {
+    message RowIdRange {
       uint64 start_row_id = 1;
       uint64 num_rows = 2;
     }
@@ -50,7 +50,7 @@ message Transaction {
     // dataset version identified by read_version. Multiple append operations
     // may consume disjoint sub-ranges from the same reservation as long as
     // they continue to reference that reserve version.
-    optional ReservedRowIds row_ids = 2;
+    optional RowIdRange row_ids = 2;
   }
 
   // Mark rows as deleted.
