@@ -273,6 +273,7 @@ class IndicesBuilder:
                 accelerator=accelerator,
                 sample_rate=sample_rate,
                 max_iters=max_iters,
+                storage_options=self.dataset.latest_storage_options(),
             )
 
         # Global IVF training

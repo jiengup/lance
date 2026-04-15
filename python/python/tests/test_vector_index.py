@@ -593,7 +593,7 @@ def test_create_index_accelerator_fallback(tmp_path, caplog):
     )
 
 
-def test_create_index_requires_external_cuvs_backend(tmp_path, monkeypatch):
+def test_create_index_requires_pylance_cuvs_backend(tmp_path, monkeypatch):
     tbl = create_table()
     dataset = lance.write_dataset(tbl, tmp_path)
     original_import_module = lance_cuvs.import_module
@@ -605,7 +605,8 @@ def test_create_index_requires_external_cuvs_backend(tmp_path, monkeypatch):
 
     monkeypatch.setattr(lance_cuvs, "import_module", _raise_missing)
     with pytest.raises(
-        ModuleNotFoundError, match="requires the external 'lance-cuvs' package"
+        ModuleNotFoundError,
+        match="requires the optional 'pylance-cuvs' loader package",
     ):
         dataset.create_index(
             "vector",
@@ -719,6 +720,7 @@ def test_build_vector_index_on_cuvs_delegates_to_external_backend(tmp_path, monk
 def test_prepare_global_ivf_pq_delegates_to_external_cuvs_backend(tmp_path, monkeypatch):
     ds = _make_sample_dataset_base(tmp_path, "prepare_ivf_pq_cuvs_ds", 512, 128)
     builder = IndicesBuilder(ds, "vector")
+    ds._storage_options = {"region": "us-east-1"}
     training = _make_fake_cuvs_training()
     calls = {}
 
@@ -752,9 +754,22 @@ def test_prepare_global_ivf_pq_delegates_to_external_cuvs_backend(tmp_path, monk
         "max_iters": 20,
         "num_bits": 8,
         "filter_nan": True,
+        "storage_options": {"region": "us-east-1"},
     }
     assert prepared["ivf_centroids"].equals(training.ivf_centroids())
     assert prepared["pq_codebook"].equals(training.pq_codebook())
+
+
+def test_require_lance_cuvs_rejects_incompatible_backend(monkeypatch):
+    class _IncompleteBackend:
+        def train_ivf_pq(self, *args, **kwargs):
+            raise AssertionError("should not be called")
+
+    monkeypatch.setattr(lance_cuvs, "import_module", lambda name: _IncompleteBackend())
+    with pytest.raises(
+        ImportError, match="missing backend APIs: build_ivf_pq_artifact"
+    ):
+        lance_cuvs._require_lance_cuvs()
 
 
 def test_create_index_rejects_missing_precomputed_partition_artifact(tmp_path):

@@ -3291,7 +3291,7 @@ class LanceDataset(pa.dataset.Dataset):
 
             - "cuda" (Nvidia GPU)
             - "mps" (Apple Silicon GPU)
-            - "cuvs" for the external `lance-cuvs` backend
+            - "cuvs" for the optional `pylance-cuvs` backend
 
             If not set, use the CPU.
         index_cache_size : int, optional
@@ -3363,9 +3363,10 @@ class LanceDataset(pa.dataset.Dataset):
                 The version of the index file. Default is "V3".
             - precomputed_partition_artifact_uri
                 An advanced input produced by an external backend such as
-                `lance-cuvs`. When set, Lance skips its own partition assignment
-                and consumes the precomputed partition-local artifact during
-                finalization. Requires `ivf_centroids` and `pq_codebook`.
+                `pylance-cuvs`. When set, Lance skips its own partition
+                assignment and consumes the precomputed partition-local artifact
+                during finalization. Requires `ivf_centroids` and
+                `pq_codebook`.
 
         Optional parameters for `IVF_RQ`:
 
@@ -3411,7 +3412,7 @@ class LanceDataset(pa.dataset.Dataset):
         - *accelerate*: use GPU to train IVF partitions.
             Supports CUDA (Nvidia) and MPS (Apple) via the built-in torch path.
             `accelerator="cuvs"` delegates IVF_PQ build preparation to the
-            external `lance-cuvs` package.
+            optional `pylance-cuvs` backend.
 
         .. code-block:: python
 
