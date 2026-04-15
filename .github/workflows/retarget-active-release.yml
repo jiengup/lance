@@ -1,0 +1,73 @@
+name: Retarget Active Release Branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: 'Source branch to retarget from'
+        required: true
+        default: 'main'
+        type: string
+      dry_run:
+        description: 'Dry run (simulate without pushing)'
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  retarget-active-release:
+    runs-on: ubuntu-latest
+    outputs:
+      active_release_branch: ${{ steps.retarget.outputs.ACTIVE_RELEASE_BRANCH }}
+      release_version: ${{ steps.retarget.outputs.RELEASE_VERSION }}
+      previous_head: ${{ steps.retarget.outputs.PREVIOUS_HEAD }}
+      source_sha: ${{ steps.retarget.outputs.SOURCE_SHA }}
+      target_sha: ${{ steps.retarget.outputs.TARGET_SHA }}
+    steps:
+    - name: Output Inputs
+      run: echo "${{ toJSON(github.event.inputs) }}"
+
+    - name: Check out repository
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      with:
+        ref: ${{ inputs.source_branch }}
+        token: ${{ secrets.LANCE_RELEASE_TOKEN }}
+        fetch-depth: 0
+        lfs: true
+
+    - name: Setup release environment
+      uses: ./.github/actions/setup-release-env
+
+    - name: Retarget active release branch
+      id: retarget
+      run: |
+        bash ci/retarget_active_release.sh "${{ inputs.source_branch }}"
+
+    - name: Push changes (if not dry run)
+      if: ${{ !inputs.dry_run }}
+      run: |
+        git push --force-with-lease=refs/heads/${{ steps.retarget.outputs.ACTIVE_RELEASE_BRANCH }}:${{ steps.retarget.outputs.PREVIOUS_HEAD }} \
+          origin HEAD:refs/heads/${{ steps.retarget.outputs.ACTIVE_RELEASE_BRANCH }}
+
+    - name: Summary
+      run: |
+        echo "## Active Release Retarget Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **Source Branch:** ${{ inputs.source_branch }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Active Release Branch:** ${{ steps.retarget.outputs.ACTIVE_RELEASE_BRANCH }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Release Version:** ${{ steps.retarget.outputs.RELEASE_VERSION }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Previous Head:** ${{ steps.retarget.outputs.PREVIOUS_HEAD }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Source Head:** ${{ steps.retarget.outputs.SOURCE_SHA }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Retargeted Head:** ${{ steps.retarget.outputs.TARGET_SHA }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Dry Run:** ${{ inputs.dry_run }}" >> $GITHUB_STEP_SUMMARY
+
+        if [ "${{ inputs.dry_run }}" == "true" ]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ This was a dry run. No changes were pushed." >> $GITHUB_STEP_SUMMARY
+        else
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Retargeted ${{ steps.retarget.outputs.ACTIVE_RELEASE_BRANCH }} to ${{ inputs.source_branch }} while keeping version ${{ steps.retarget.outputs.RELEASE_VERSION }}." >> $GITHUB_STEP_SUMMARY
+        fi

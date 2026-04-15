@@ -28,6 +28,11 @@ All Lance projects follow [semantic versioning](https://semver.org/) spec for re
 
 Preview releases use the `-beta.X` prerelease suffix appended to the target stable version (e.g., `1.2.3-beta.1`, `1.2.3-beta.2`).
 
+Once a release branch is created for a major or minor release, that release train moves to the `-rc.X` track and should not go back to `-beta.X`.
+If the active release branch needs the latest code from `main`, maintainers should retarget the active release branch to `main` and then cut the next RC from that branch.
+Retargeting only moves the active release branch forward to the latest `main` contents while keeping the release branch on its existing prerelease version line.
+It never rewrites existing tags, and it only applies to the unique active release branch whose final `vX.Y.0` tag does not exist yet.
+
 Note that unlike major and minor version releases that are cut from the main branch,
 patch version releases should be applied on top of an existing major, minor or patch release commit.
 Patch releases should only contain critical fixes for cases such as security vulnerabilities, major correctness issues,
@@ -37,6 +42,15 @@ It is strongly discouraged to continue adding patch releases to old versions.
 
 For major version releases, it is recommended to include a migration guide for users to understand how to
 handle any breaking changes introduced in the major version.
+
+## Release Workflow
+
+The default release workflow for a major or minor release is:
+
+1. Use `create-release-branch` to create the initial release branch and `rc.1`.
+2. If more changes from `main` should be included before the stable release, use `retarget-active-release` to rebuild the active release branch from the latest `main`.
+3. Use `create-rc` to publish the next RC (`rc.2`, `rc.3`, and so on).
+4. Once the vote passes, use `approve-rc` to publish the stable release.
 
 ## Project Specific Release Process
 
