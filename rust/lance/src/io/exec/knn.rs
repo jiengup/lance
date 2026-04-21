@@ -109,7 +109,7 @@ impl AnnIndexMetrics {
     }
 }
 
-const RESULTS_CACHE_LIMIT: usize = 100;
+const RESULTS_CACHE_LIMIT: usize = 1000;
 const VECTOR_RESULTS_CACHE_HITS_METRIC: &str = "vector_results_cache_hits";
 const VECTOR_RESULTS_CACHE_MISSES_METRIC: &str = "vector_results_cache_misses";
 const VECTOR_RESULTS_CACHE_ENV: &str = "LANCE_EXPERIMENTAL_VECTOR_RESULTS_CACHE";
@@ -2457,15 +2457,15 @@ mod tests {
         );
 
         let oversized = make_result(
-            (0..120)
-                .map(|offset| (1, offset, 120.0 - offset as f32))
+            (0..1200)
+                .map(|offset| (1, offset, 1200.0 - offset as f32))
                 .collect(),
         );
         let merged =
             ANNIvfSubIndexExec::merge_partition_candidates(&[oversized], RESULTS_CACHE_LIMIT);
         assert_eq!(merged.len(), RESULTS_CACHE_LIMIT);
-        assert_eq!(merged[0].offset_in_partition, 119);
-        assert_eq!(merged.last().unwrap().offset_in_partition, 20);
+        assert_eq!(merged[0].offset_in_partition, 1199);
+        assert_eq!(merged.last().unwrap().offset_in_partition, 200);
     }
 
     #[tokio::test]
@@ -2858,7 +2858,7 @@ mod tests {
         fixture
             .dataset
             .scan()
-            .nearest("vector", q.as_ref(), 60)
+            .nearest("vector", q.as_ref(), 600)
             .unwrap()
             .minimum_nprobes(16)
             .maximum_nprobes(16)
