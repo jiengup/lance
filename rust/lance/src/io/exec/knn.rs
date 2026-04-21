@@ -57,7 +57,7 @@ use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::IndexMetadata;
 use tokio::sync::Notify;
 
-use crate::dataset::{Dataset, ProjectionRequest};
+use crate::dataset::Dataset;
 use crate::index::DatasetIndexInternalExt;
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
 use crate::index::vector::utils::{get_vector_type, validate_distance_type_for};
@@ -917,63 +917,82 @@ impl ANNIvfSubIndexExec {
             .collect()
     }
 
-    async fn resolve_cached_row_ids(
-        index: Arc<dyn VectorIndex>,
-        candidates: &[PartitionSearchCandidate],
-        metrics: &dyn lance_index::metrics::MetricsCollector,
-    ) -> Result<Vec<u64>> {
-        let mut offsets_by_partition: HashMap<u32, Vec<(usize, u32)>> = HashMap::new();
-        for (idx, candidate) in candidates.iter().enumerate() {
-            offsets_by_partition
-                .entry(candidate.partition_id)
-                .or_default()
-                .push((idx, candidate.offset_in_partition));
-        }
-
-        let mut row_ids = vec![0_u64; candidates.len()];
-        for (partition_id, offsets) in offsets_by_partition {
-            let partition_offsets = offsets.iter().map(|(_, offset)| *offset).collect_vec();
-            let resolved = index
-                .resolve_partition_row_ids(partition_id as usize, &partition_offsets, metrics)
-                .await?;
-            debug_assert_eq!(resolved.len(), offsets.len());
-            for ((original_idx, _), row_id) in offsets.into_iter().zip(resolved.into_iter()) {
-                row_ids[original_idx] = row_id;
-            }
-        }
-        Ok(row_ids)
-    }
-
     async fn replay_cached_candidates(
-        dataset: Arc<Dataset>,
         index: Arc<dyn VectorIndex>,
         query: &Query,
         candidates: &[PartitionSearchCandidate],
+        partitions: &UInt32Array,
+        q_c_dists: &Float32Array,
         metrics: &dyn lance_index::metrics::MetricsCollector,
     ) -> Result<RecordBatch> {
-        let row_ids = Self::resolve_cached_row_ids(index.clone(), candidates, metrics).await?;
-        if row_ids.is_empty() {
+        if candidates.is_empty() {
             return Ok(RecordBatch::new_empty(KNN_INDEX_SCHEMA.clone()));
         }
 
-        let projection =
-            ProjectionRequest::from_columns([query.column.as_str(), ROW_ID], dataset.schema());
-        let batch = dataset.take_rows(&row_ids, projection).await?;
-        let batch = compute_distance(
-            query.key.clone(),
-            query.metric_type.unwrap_or(index.metric_type()),
-            &query.column,
-            batch,
-        )
-        .await?;
-
-        let row_id_arr = batch[ROW_ID].as_primitive::<UInt64Type>();
-        let dist_arr = batch[DIST_COL].as_primitive::<Float32Type>();
-        let mut scored = row_id_arr
+        let q_c_dist_by_partition = partitions
             .values()
             .iter()
             .copied()
-            .zip(dist_arr.values().iter().copied())
+            .zip(q_c_dists.values().iter().copied())
+            .collect::<HashMap<_, _>>();
+        let mut offsets_by_partition: HashMap<u32, Vec<u32>> = HashMap::new();
+        for candidate in candidates {
+            offsets_by_partition
+                .entry(candidate.partition_id)
+                .or_default()
+                .push(candidate.offset_in_partition);
+        }
+        let grouped_candidates = offsets_by_partition
+            .into_iter()
+            .map(|(partition_id, offsets)| {
+                let dist_q_c = q_c_dist_by_partition
+                    .get(&partition_id)
+                    .copied()
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "cached partition {} missing centroid distance for replay",
+                            partition_id
+                        ))
+                    })?;
+                Ok((partition_id, dist_q_c, offsets))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let approx_query = Self::normalize_query_for_index(index.as_ref(), query)?;
+        let scored_batches = stream::iter(grouped_candidates)
+            .map(|(partition_id, dist_q_c, offsets)| {
+                let mut partition_query = approx_query.clone();
+                partition_query.dist_q_c = dist_q_c;
+                let index = index.clone();
+                async move {
+                    index
+                        .score_partition_candidates(
+                            partition_id as usize,
+                            &partition_query,
+                            &offsets,
+                            metrics,
+                        )
+                        .await
+                }
+            })
+            .buffered(get_num_compute_intensive_cpus())
+            .try_collect::<Vec<_>>()
+            .await?;
+        let mut scored = scored_batches
+            .iter()
+            .flat_map(|batch| {
+                batch[ROW_ID]
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .iter()
+                    .copied()
+                    .zip(
+                        batch[DIST_COL]
+                            .as_primitive::<Float32Type>()
+                            .values()
+                            .iter()
+                            .copied(),
+                    )
+            })
             .filter(|(_, dist)| !dist.is_nan())
             .collect::<Vec<_>>();
         scored.sort_by(|(left_row_id, left_dist), (right_row_id, right_dist)| {
@@ -1020,10 +1039,11 @@ impl ANNIvfSubIndexExec {
         if let Some(cache_entry) = cache.get_with_key(&cache_key).await {
             metrics.results_cache_hits.add(1);
             let batch = Self::replay_cached_candidates(
-                dataset,
                 index,
                 query,
                 &cache_entry.candidates,
+                &partitions,
+                &q_c_dists,
                 &metrics.index_metrics,
             )
             .await?;
@@ -1059,10 +1079,11 @@ impl ANNIvfSubIndexExec {
             .await?;
         let candidates = Self::merge_partition_candidates(&search_results, RESULTS_CACHE_LIMIT);
         let batch = Self::replay_cached_candidates(
-            dataset,
             index,
             query,
             &candidates,
+            &partitions,
+            &q_c_dists,
             &metrics.index_metrics,
         )
         .await?;
@@ -2443,7 +2464,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_results_cache_resolve_candidate_row_ids_round_trip() {
+    async fn test_results_cache_score_candidate_round_trip() {
         let fixture = NprobesTestFixture::new(100, 1).await;
         let indices = fixture.dataset.load_indices().await.unwrap();
         let index_uuid = indices[0].uuid.to_string();
@@ -2492,14 +2513,123 @@ mod tests {
             .as_primitive::<UInt64Type>()
             .values()
             .to_vec();
-        let actual_row_ids = ANNIvfSubIndexExec::resolve_cached_row_ids(
+        let expected_dists = search_result.batch[DIST_COL]
+            .as_primitive::<Float32Type>()
+            .values()
+            .to_vec();
+        let cached_offsets = search_result
+            .candidates
+            .iter()
+            .map(|candidate| candidate.offset_in_partition)
+            .collect::<Vec<_>>();
+        let actual_batch = raw_index
+            .score_partition_candidates(
+                partitions.value(0) as usize,
+                &partition_query,
+                &cached_offsets,
+                &lance_index::metrics::NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let actual_row_ids = actual_batch[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec();
+        let actual_dists = actual_batch[DIST_COL]
+            .as_primitive::<Float32Type>()
+            .values()
+            .to_vec();
+        assert_eq!(actual_row_ids, expected_row_ids);
+        assert_eq!(actual_dists, expected_dists);
+    }
+
+    #[tokio::test]
+    async fn test_results_cache_replay_uses_quantized_partition_scoring() {
+        let fixture = NprobesTestFixture::new(100, 1).await;
+        let indices = fixture.dataset.load_indices().await.unwrap();
+        let index_uuid = indices[0].uuid.to_string();
+        let raw_index = fixture
+            .dataset
+            .open_vector_index(
+                "vector",
+                &index_uuid,
+                &lance_index::metrics::NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let query = Query {
+            column: "vector".to_string(),
+            key: fixture.get_centroid(0),
+            k: 10,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: 1,
+            maximum_nprobes: Some(1),
+            ef: None,
+            refine_factor: None,
+            metric_type: Some(DistanceType::L2),
+            use_index: true,
+            dist_q_c: 0.0,
+        };
+        let (partitions, q_c_dists) = raw_index.find_partitions(&query).unwrap();
+        let mut partition_query = query.clone();
+        partition_query.dist_q_c = q_c_dists.value(0);
+        let search_result = raw_index
+            .search_in_partition_with_candidates(
+                partitions.value(0) as usize,
+                &partition_query,
+                Arc::new(DatasetPreFilter::new(
+                    Arc::new(fixture.dataset.clone()),
+                    &indices,
+                    None,
+                )),
+                &lance_index::metrics::NoOpMetricsCollector,
+                10,
+            )
+            .await
+            .unwrap();
+        let replayed = ANNIvfSubIndexExec::replay_cached_candidates(
             raw_index,
+            &query,
             &search_result.candidates,
+            &partitions,
+            &q_c_dists,
             &lance_index::metrics::NoOpMetricsCollector,
         )
         .await
         .unwrap();
-        assert_eq!(actual_row_ids, expected_row_ids);
+        let mut expected_pairs = search_result.batch[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .zip(
+                search_result.batch[DIST_COL]
+                    .as_primitive::<Float32Type>()
+                    .values()
+                    .iter()
+                    .copied(),
+            )
+            .collect::<Vec<_>>();
+        expected_pairs.sort_by(|(left_row_id, left_dist), (right_row_id, right_dist)| {
+            left_dist
+                .total_cmp(right_dist)
+                .then_with(|| left_row_id.cmp(right_row_id))
+        });
+        let actual_pairs = replayed[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .zip(
+                replayed[DIST_COL]
+                    .as_primitive::<Float32Type>()
+                    .values()
+                    .iter()
+                    .copied(),
+            )
+            .collect::<Vec<_>>();
+        assert_eq!(actual_pairs, expected_pairs);
     }
 
     #[rstest]

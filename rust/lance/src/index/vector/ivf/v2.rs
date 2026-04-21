@@ -11,7 +11,7 @@ use crate::index::vector::{IndexFileVersion, builder::index_type_string};
 use crate::index::{PreFilter, vector::VectorIndex};
 use arrow::compute::concat_batches;
 use arrow_arith::numeric::sub;
-use arrow_array::{Float32Array, RecordBatch, UInt32Array};
+use arrow_array::{Float32Array, RecordBatch, UInt32Array, UInt64Array};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -40,13 +40,14 @@ use lance_index::vector::quantizer::{
     QuantizationType, Quantizer, QuantizerMetadata, QuantizerStorage,
 };
 use lance_index::vector::sq::ScalarQuantizer;
-use lance_index::vector::storage::VectorStore;
+use lance_index::vector::storage::{DistCalculator, VectorStore};
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
     INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, Index, IndexType, pb,
     vector::{
-        DISTANCE_TYPE_KEY, PartitionSearchResult, Query, ivf::storage::IVF_METADATA_KEY,
-        quantizer::Quantization, storage::IvfQuantizationStorage, v3::subindex::IvfSubIndex,
+        DIST_COL, DISTANCE_TYPE_KEY, PartitionSearchResult, Query, VECTOR_RESULT_SCHEMA,
+        ivf::storage::IVF_METADATA_KEY, quantizer::Quantization, storage::IvfQuantizationStorage,
+        v3::subindex::IvfSubIndex,
     },
 };
 use lance_index::{INDEX_METADATA_SCHEMA_KEY, IndexMetadata};
@@ -1042,6 +1043,57 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             row_ids.push(part.storage.row_id(offset));
         }
         Ok(row_ids)
+    }
+
+    async fn score_partition_candidates(
+        &self,
+        partition_id: usize,
+        query: &Query,
+        offsets_in_partition: &[u32],
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
+        let part_entry = self.load_partition(partition_id, true, metrics).await?;
+        let query = self.preprocess_query(partition_id, query)?;
+        let offsets_in_partition = offsets_in_partition.to_vec();
+        let (batch, local_metrics) = spawn_cpu(move || {
+            let local_metrics = LocalMetricsCollector::default();
+            let part = part_entry
+                .as_any()
+                .downcast_ref::<PartitionEntry<S, Q>>()
+                .ok_or(Error::internal(
+                    "failed to downcast partition entry".to_string(),
+                ))?;
+            let partition_len = part.storage.len();
+            let dist_calc = part.storage.dist_calculator(query.key, query.dist_q_c);
+            local_metrics.record_comparisons(offsets_in_partition.len());
+
+            let mut row_ids = Vec::with_capacity(offsets_in_partition.len());
+            let mut dists = Vec::with_capacity(offsets_in_partition.len());
+            for offset in offsets_in_partition {
+                if offset as usize >= partition_len {
+                    return Err(Error::index(format!(
+                        "partition offset {} is out of range for partition {} with {} rows",
+                        offset, partition_id, partition_len
+                    )));
+                }
+                row_ids.push(part.storage.row_id(offset));
+                dists.push(dist_calc.distance(offset));
+            }
+
+            let batch = RecordBatch::try_new(
+                VECTOR_RESULT_SCHEMA.clone(),
+                vec![
+                    Arc::new(Float32Array::from(dists)),
+                    Arc::new(UInt64Array::from(row_ids)),
+                ],
+            )?;
+            Result::Ok((batch, local_metrics))
+        })
+        .await?;
+
+        debug_assert_eq!(batch.schema().field(0).name(), DIST_COL);
+        local_metrics.dump_into(metrics);
+        Ok(batch)
     }
 
     fn is_loadable(&self) -> bool {

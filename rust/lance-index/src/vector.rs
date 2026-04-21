@@ -236,6 +236,18 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         Err(Error::not_supported("resolve_partition_row_ids"))
     }
 
+    /// Re-score cached partition-local offsets against the current query using
+    /// the index's native storage representation.
+    async fn score_partition_candidates(
+        &self,
+        _partition_id: usize,
+        _query: &Query,
+        _offsets_in_partition: &[u32],
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
+        Err(Error::not_supported("score_partition_candidates"))
+    }
+
     /// If the index is loadable by IVF, so it can be a sub-index that
     /// is loaded on demand by IVF.
     fn is_loadable(&self) -> bool;
