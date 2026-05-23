@@ -128,9 +128,7 @@ async fn main() {
         }
     };
 
-    let mut dataset = Dataset::open(uri)
-        .await
-        .expect("Failed to open dataset");
+    let mut dataset = Dataset::open(uri).await.expect("Failed to open dataset");
     println!("Dataset schema: {:#?}", dataset.schema());
 
     let metric_type = MetricType::try_from(args.metric_type.as_str()).unwrap();
